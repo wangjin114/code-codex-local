@@ -1,6 +1,6 @@
 # Local maintenance snapshot: 0.5.7-local.1
 
-This is an unofficial private backup of the 0.5.7 build installed and verified on 2026-10-19, uploaded on 2026-10-22. Original author/project: Rice-dog and Code-Codex contributors, https://github.com/Rice-dog/code-codex. Immutable upstream commit: dbbc665b677624a26b98fdcd41f1db3f1a407bd2. The application version remains 0.5.7; the separate GitHub release tag is v0.5.7-local.1 to distinguish this maintenance build.
+This is an unofficial local maintenance snapshot of the 0.5.7 build installed and verified on 2026-10-19, uploaded on 2026-10-22. Original author/project: Rice-dog and Code-Codex contributors, https://github.com/Rice-dog/code-codex. Immutable upstream commit: dbbc665b677624a26b98fdcd41f1db3f1a407bd2. The application version remains 0.5.7; the separate GitHub release tag is v0.5.7-local.1 to distinguish this maintenance build.
 
 ## Retained local changes
 
@@ -27,8 +27,12 @@ Build with Node24, npm ci in packages/explorer-ui, npm run build there, and scri
 - EFS migration7, storage27, retention18, plugin contracts22 and versioned launcher18 checks passed. Independent source review accepted with zero remaining Critical/Important/Minor findings.
 - Two real launches after installation qualified with fresh processes/logs, responsive UI, runtime preflight before activation and cache reuse. Existing settings and media matched; no OS reboot, MSI installation, EXE GUI execution or restore drill is claimed.
 - At the installation-date audit there were two moderate dependency advisories. A fresh 2026-10-22 audit of the same locked dependencies reports one high-severity package (markdown-it) and one moderate-severity package (DOMPurify); see DEPENDENCY_AUDIT.json. Dependencies are unchanged to preserve this exact installed version. Markdown-it linkify is used; DOMPurify IN_PLACE is not used by these consumers. No security-clean claim is made.
-- Keep THIRD_PARTY_NOTICES_EN.md and THIRD_PARTY_NOTICES_ZH_CN.md: some visual effects have conditional or unverified redistribution evidence. This repository is private personal backup, not a declaration that all assets are MIT or cleared for public release.
+- Keep THIRD_PARTY_NOTICES_EN.md and THIRD_PARTY_NOTICES_ZH_CN.md: some visual effects have conditional or unverified redistribution evidence. This repository was initially a private personal backup and became public at the owner's request on 2026-10-22. Public visibility does not establish that all assets are MIT or cleared for redistribution.
 
 No chat history, account settings, user media, application profile, private backup, credentials, local source-control metadata or raw diagnostic logs are included.
 
 Independent publication-snapshot UI rebuild reproduced explorer.js and startup-early.js byte-for-byte. Native binary reproducibility is still not claimed.
+
+## Public visibility update
+
+The original release tag and seven attachments remain byte-for-byte unchanged. This main-branch documentation update records the owner-requested visibility change. Original archives and metadata may still say private backup because that was their original publication context. Some native executables contain ordinary compiler-generated Cargo dependency source paths including the local Windows username. No credentials, chat records, settings, user media or application profiles were found in the reviewed publication files. Existing third-party licensing uncertainties are retained rather than represented as resolved.

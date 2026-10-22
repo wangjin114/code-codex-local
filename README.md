@@ -1,10 +1,12 @@
-> **本地版本下载 / Local build:** [v0.5.7-local.1 private release](https://github.com/wangjin114/code-codex-local/releases/tag/v0.5.7-local.1). This is the exact installed-build installer/ZIP, with checksums and an independent source snapshot.
+> Repository visibility changed to public on 2026-10-22 at the owner's request. Original release archives and checksums remain unchanged; their earlier private-backup labels record the original publication context. Some native binaries retain compiler-generated local Cargo source paths. Third-party conditional/unverified permission notices remain applicable.
 
-> **非官方本地修改版 / Unofficial local maintenance build — private personal backup**
+> **本地版本下载 / Local build:** [v0.5.7-local.1 local release](https://github.com/wangjin114/code-codex-local/releases/tag/v0.5.7-local.1). This is the exact installed-build installer/ZIP, with checksums and an independent source snapshot.
+
+> **非官方本地修改版 / Unofficial local maintenance build — public source snapshot**
 >
 > 原作者与原版来源：**Rice-dog / Code-Codex contributors**，原仓库 [Rice-dog/code-codex](https://github.com/Rice-dog/code-codex)。本版基于 [v0.5.7](https://github.com/Rice-dog/code-codex/releases/tag/v0.5.7)，固定上游提交 [dbbc665b677624a26b98fdcd41f1db3f1a407bd2](https://github.com/Rice-dog/code-codex/commit/dbbc665b677624a26b98fdcd41f1db3f1a407bd2)。原项目与 OpenAI 无关，本仓库也不是原作者的官方发布。
 >
-> Original work: **Rice-dog and Code-Codex contributors**. This private snapshot contains local maintenance changes on upstream v0.5.7. Preserve the original [MIT license](LICENSE) and all third-party notices. MIT does not automatically cover every bundled visual effect or asset; existing notices include conditional and unverified redistribution permissions. This backup does not resolve those permissions or authorize public redistribution.
+> Original work: **Rice-dog and Code-Codex contributors**. This maintenance snapshot contains local maintenance changes on upstream v0.5.7. Preserve the original [MIT license](LICENSE) and all third-party notices. MIT does not automatically cover every bundled visual effect or asset; existing notices include conditional and unverified redistribution permissions. This backup does not resolve those permissions or authorize public redistribution.
 >
 > 本地修改、构建对应关系及验证边界见 [LOCAL_CHANGES.md](LOCAL_CHANGES.md)。本地播放器为 **1.1.26-local.1**；清单保留上游 source/releaseTag 并设置 localOnly，不向上游请求该本地版本。安装包中的上游下载说明和 SBOM 命名空间保持原样；本地构建的来源以本仓库发布说明及哈希清单为准。
 

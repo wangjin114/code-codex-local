@@ -1,0 +1,62 @@
+{
+  "observedOn": "2026-10-22",
+  "dependenciesChanged": false,
+  "metadata": {
+    "info": 0,
+    "low": 0,
+    "moderate": 1,
+    "high": 1,
+    "critical": 0,
+    "total": 2
+  },
+  "packages": [
+    {
+      "name": "dompurify",
+      "severity": "moderate",
+      "advisories": [
+        {
+          "title": "DOMPurify: IN_PLACE hook removal leaves a detached subtree executable, causing XSS",
+          "url": "https://github.com/advisories/GHSA-55q2-fjhq-7xh7",
+          "severity": "moderate",
+          "range": "<=3.4.12"
+        },
+        {
+          "title": "DOMPurify: IN_PLACE returns a force-removed rawtext root whose text carries attacker markup — pure HTML reparse executes",
+          "url": "https://github.com/advisories/GHSA-6688-9rhm-gjv2",
+          "severity": "low",
+          "range": "<=3.4.15"
+        }
+      ]
+    },
+    {
+      "name": "markdown-it",
+      "severity": "high",
+      "advisories": [
+        {
+          "title": "markdown-it linkify: true has two quadratic paths, so a few hundred KB of markdown blocks the event loop for tens of seconds",
+          "url": "https://github.com/advisories/GHSA-253c-mchw-3w2r",
+          "severity": "moderate",
+          "range": "=15.0.0"
+        },
+        {
+          "title": "markdown-it: Quadratic complexity in smartquotes with unmatched closing quotes",
+          "url": "https://github.com/advisories/GHSA-r7fv-28h4-cvq7",
+          "severity": "high",
+          "range": ">=15.0.0 <15.0.2"
+        },
+        {
+          "title": "markdown-it: Quadratic-time denial of service in inline HTML parsing with html enabled",
+          "url": "https://github.com/advisories/GHSA-vfgh-jcmw-g37q",
+          "severity": "low",
+          "range": ">=15.0.0 <15.0.3"
+        },
+        {
+          "title": "markdown-it: Quadratic-time rendering of a single multi-line link reference definition with default options (regression since 14.0)",
+          "url": "https://github.com/advisories/GHSA-gfr2-rv44-r23c",
+          "severity": "high",
+          "range": ">=15.0.0 <15.0.3"
+        }
+      ]
+    }
+  ]
+}

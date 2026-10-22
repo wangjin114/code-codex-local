@@ -1,0 +1,85 @@
+[package]
+name = "code-codex"
+description = "Windows-first launcher and supervisor for Code-Codex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "code-codex"
+autobins = false
+
+[[bin]]
+name = "code-codex"
+path = "src/main.rs"
+
+[[bin]]
+name = "code-codex-launcher"
+path = "src/bin/code-codex-launcher.rs"
+
+[[bin]]
+name = "code-codex-shim"
+path = "src/bin/code-codex-shim.rs"
+
+[[bin]]
+name = "code-codex-setup"
+path = "src/bin/code-codex-setup.rs"
+
+[[bin]]
+name = "code-codex-uninstall"
+path = "src/bin/code-codex-uninstall.rs"
+
+[[bin]]
+name = "code-codex-shortcut"
+path = "src/bin/code-codex-shortcut.rs"
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+cdp-client = { path = "../cdp-client" }
+clap.workspace = true
+context-resolver = { path = "../context-resolver" }
+dunce.workspace = true
+futures-util.workspace = true
+process-wrap.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+regex-automata = "0.4"
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+same-file = "1.0.6"
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+workspace-service = { path = "../workspace-service" }
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["rustls-tls-native-roots", "system-proxy"] }
+known-folders = "1.4.2"
+win32job = "2.0.3"
+windows-permissions = "0.2.4"
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_System_IO", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Graphics_Dwm", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+junction = "2.0.0"
+
+[build-dependencies]
+embed-resource = "3.0.11"
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+
+[lints.rust]
+unsafe_code = "allow"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

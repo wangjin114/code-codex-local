@@ -1,0 +1,1391 @@
+//! Clickable, windowless entry point for the portable installer script.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+use base64::Engine as _;
+use gui_support::setup_observability::{SetupJournal, bounded_checks};
+use serde::Deserialize;
+use serde_json::json;
+use std::env;
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Output, Stdio};
+use std::time::Duration;
+
+#[path = "../gui_support.rs"]
+mod gui_support;
+#[path = "../script_wrapper.rs"]
+mod script_wrapper;
+
+const TITLE: &str = "Code-Codex setup";
+const INSTALL_SCRIPT: &str = "Install-CodeCodex.ps1";
+const FOOTER_MAGIC: &[u8; 8] = b"CLEXZIP1";
+const FOOTER_LENGTH: u64 = 24;
+const MAX_SCRIPT_DIAGNOSTIC_CHARS: usize = 65_536;
+const TRUNCATION_MARKER: &str = "\n[diagnostic output truncated]";
+const INSTALL_ERROR_PREFIX: &str = "CODECODEX_INSTALL_ERROR:";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallErrorReport {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    installation_committed: bool,
+    #[serde(default)]
+    rollback: serde_json::Value,
+    stage: String,
+    operation: String,
+    target_name: String,
+    target_exists: Option<bool>,
+    attempt: u32,
+    exception: String,
+    hresult: String,
+    win32: Option<u32>,
+    line: Option<u32>,
+    message_base64: String,
+    #[serde(default)]
+    timeline: serde_json::Value,
+    #[serde(default)]
+    exception_chain: serde_json::Value,
+    #[serde(default)]
+    process_environment: serde_json::Value,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    error_id: String,
+}
+const EXPAND_ARCHIVE_SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); try { Expand-Archive -LiteralPath $env:CLE_ARCHIVE_PATH -DestinationPath $env:CLE_DESTINATION_PATH -Force } catch { $e=$_.Exception.GetBaseException(); $hr=[Convert]::ToString($e.HResult,16).ToUpperInvariant().PadLeft(8,'0'); $detail=[ordered]@{stage='Expanding package';operation='Expand-Archive';targetName='installer payload';targetExists=$null;attempt=1;exception=$e.GetType().Name;hresult='0x'+$hr;win32=$(if($hr.StartsWith('8007')){[Convert]::ToInt32($hr.Substring(4),16)}else{$null});line=$_.InvocationInfo.ScriptLineNumber;messageBase64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($e.Message))}; [Console]::Out.WriteLine('CODECODEX_INSTALL_ERROR:'+(ConvertTo-Json -InputObject $detail -Compress)); exit 1 }"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupSource {
+    Sibling,
+    Embedded {
+        payload_offset: u64,
+        payload_length: u64,
+        executable_length: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortableExecutableLayout {
+    image_end: usize,
+    certificate_range: Option<(usize, usize)>,
+}
+
+fn main() -> ExitCode {
+    let mut arguments: Vec<_> = env::args_os().skip(1).collect();
+    match requested_ui_language(&arguments){
+        Ok(Some(locale))=>gui_support::localization::set_session(locale),Ok(None)=>{},
+        Err(error)=>{gui_support::show_dialog(TITLE,&error,true);return ExitCode::FAILURE;}
+    }
+    let automatic_update = env::var_os("CLE_UPDATE_WINDOW_READY").is_some();
+    let interactive = wants_setup_selection(&arguments, automatic_update);
+    let branded_wizard = interactive || automatic_update;
+    let mut progress = if interactive {
+        gui_support::ProgressDialog::open_setup(
+            TITLE,
+            env!("CARGO_PKG_VERSION"),
+            explicit_install_root(&arguments),
+            include_bytes!("../../resources/setup-brand-background.png"),
+            include_str!("../../../../LICENSE"),
+        )
+    } else if automatic_update {
+        gui_support::ProgressDialog::open_update(
+            TITLE,
+            env!("CARGO_PKG_VERSION"),
+            include_bytes!("../../resources/setup-brand-background.png"),
+            include_str!("../../../../LICENSE"),
+        )
+    } else {
+        gui_support::ProgressDialog::open(TITLE, "Preparing setup...", 5, env!("CARGO_PKG_VERSION"))
+    };
+    let journal = progress.journal();
+    journal.event(
+        "setup mode",
+        "selected",
+        json!({"version":env!("CARGO_PKG_VERSION"),"manual":interactive,"automaticUpdate":automatic_update,"brandedWizard":branded_wizard,"pid":std::process::id()}),
+    );
+    save_session(&journal, "running");
+    // The updater owns this private rendezvous directory. Never infer readiness
+    // from process creation: the progress form must have emitted its Shown event.
+    if progress.window_ready()
+        && let Some(path) = env::var_os("CLE_UPDATE_WINDOW_READY")
+    {
+        let path = PathBuf::from(path);
+        if path.is_absolute() && path.file_name().is_some_and(|n| n == "window-ready") {
+            match fs::write(path, "ready") {
+                Ok(()) => journal.event("updater window handoff", "confirmed", json!({})),
+                Err(e) => journal.event(
+                    "updater window handoff",
+                    "write failed",
+                    json!({"reason":e.to_string(),"osCode":e.raw_os_error()}),
+                ),
+            }
+        }
+    }
+    if branded_wizard && !progress.window_ready() {
+        let detail = format!(
+            "Setup window readiness failed before installation started. Operation: opening the branded setup window. Cause: {}",
+            progress.startup_failure().unwrap_or("No startup cause was captured; inspect the UI process timeline and bounded helper output.")
+        );
+        deliver_failure(&mut progress, &detail, false);
+        return ExitCode::FAILURE;
+    }
+    if interactive {
+        match progress.wait_for_setup_selection() {
+            Ok(Some(root)) => {
+                arguments = selected_install_arguments(&arguments, root);
+                if let Some(index)=arguments.iter().position(|v|v.eq_ignore_ascii_case("-UiLanguage")) {arguments.drain(index..(index+2).min(arguments.len()));}
+                arguments.extend([OsString::from("-UiLanguage"),OsString::from(gui_support::localization::locale().as_str())]);
+            },
+            Ok(None) => {
+                journal.event("setup", "cancelled", json!({"beforePayload":true}));
+                progress.close();
+                save_session(&journal, "cancelled");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                deliver_failure(&mut progress, &error, false);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    journal.event("installation transaction", "started", json!({}));
+    save_session(&journal, "installing");
+    match run_setup(&arguments, &mut progress) {
+        Ok(output) if output.status.success() => {
+            if String::from_utf8_lossy(&output.stdout).contains("CODECODEX_INSTALL_CANCELLED") {
+                journal.event("setup", "cancelled", json!({"installerCancelled":true}));
+                progress.close();
+                save_session(&journal, "cancelled");
+                return ExitCode::SUCCESS;
+            }
+            journal.event(
+                "installation transaction",
+                "completed",
+                json!({"exitCode":output.status.code()}),
+            );
+            journal.event("installer output","captured",json!({"stdout":sanitize_script_output(&output.stdout),"stderr":sanitize_script_output(&output.stderr)}));
+            save_session(&journal, "installed");
+            progress.set_progress_detail(
+                100,
+                "Installation complete",
+                "Code-Codex is ready to use.",
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let shortcut = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("Code-Codex managed shortcut: "))
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            let mut message = match shortcut {
+                Some(path) => format!(
+                    "Code-Codex was installed successfully.\n\nUse this desktop shortcut to start Codex with Code-Codex:\n{path}"
+                ),
+                None => "Code-Codex was installed successfully. Open the Code-Codex desktop shortcut to start Codex with Code-Codex.".to_owned(),
+            };
+            if stdout.lines().any(|line|line.trim()=="CODECODEX_LANGUAGE_NOT_SAVED") {
+                message.push_str("\n\nLanguage preference was not saved. Open Code-Codex > Language and select it again to repair this preference.");
+            }
+            if branded_wizard {
+                if let Err(error) = progress.finish_setup(&message) {
+                    deliver_failure(
+                        &mut progress,
+                        &format!(
+                            "Installation succeeded, but the completion window failed: {error}. The installed version remains valid; no rollback is requested."
+                        ),
+                        true,
+                    );
+                } else {
+                    progress.close();
+                    save_session(&journal, "completed");
+                }
+            } else {
+                progress.close();
+                save_session(&journal, "completed");
+                gui_support::show_dialog(TITLE, &message, false);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(output) => {
+            let detail = format_setup_failure(output.status.code(), &output.stdout, &output.stderr);
+            deliver_failure(&mut progress, &detail, false);
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            deliver_failure(&mut progress, &error, false);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn requested_ui_language(arguments:&[OsString])->Result<Option<workspace_service::ui_language::Locale>,String>{
+    let mut selected=None;
+    for (index,arg) in arguments.iter().enumerate(){if arg.eq_ignore_ascii_case("-UiLanguage"){
+        if selected.is_some(){return Err("CC-LANG-INVALID-001: duplicate UiLanguage".into());}
+        selected=Some(match arguments.get(index+1).and_then(|v|v.to_str()){
+            Some("en")=>workspace_service::ui_language::Locale::English,Some("zh-CN")=>workspace_service::ui_language::Locale::Chinese,
+            _=>return Err("CC-LANG-INVALID-001: UiLanguage must be zh-CN or en".into()),
+        });
+    }}Ok(selected)
+}
+
+fn wants_setup_selection(arguments: &[OsString], automatic_update: bool) -> bool {
+    arguments
+        .iter()
+        .any(|arg| arg.eq_ignore_ascii_case("-SelectDirectory"))
+        || (!automatic_update && (arguments.is_empty() || (arguments.len()==2 && arguments[0].eq_ignore_ascii_case("-UiLanguage"))))
+}
+
+fn explicit_install_root(arguments: &[OsString]) -> Option<&std::ffi::OsStr> {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0].eq_ignore_ascii_case("-InstallRoot"))
+        .map(|pair| pair[1].as_os_str())
+}
+
+fn selected_install_arguments(arguments: &[OsString], root: OsString) -> Vec<OsString> {
+    let mut result = Vec::new();
+    let mut arguments = arguments.iter();
+    while let Some(arg) = arguments.next() {
+        if arg.eq_ignore_ascii_case("-SelectDirectory") {
+            continue;
+        }
+        if arg.eq_ignore_ascii_case("-InstallRoot") {
+            arguments.next();
+            continue;
+        }
+        result.push(arg.clone());
+    }
+    result.extend([OsString::from("-InstallRoot"), root]);
+    result
+}
+
+fn save_report_file(name: &str, report: &str) -> std::io::Result<PathBuf> {
+    fn validate_file(path: &Path) -> std::io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Ok(m) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if m.file_attributes() & 0x400 != 0 {
+                        return Err(std::io::Error::other("Redirected diagnostic file refused"));
+                    }
+                }
+                if !m.is_file() || m.file_type().is_symlink() {
+                    return Err(std::io::Error::other(
+                        "Diagnostic target is not a regular file",
+                    ));
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+    fn write(root: &Path, name: &str, report: &str) -> std::io::Result<PathBuf> {
+        workspace_service::application_paths::validate_directory_path(root)?;
+        fs::create_dir_all(root)?;
+        let path = root.join(name);
+        validate_file(&path)?;
+        let staged = root.join(format!("{name}.pending"));
+        validate_file(&staged)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&staged)?;
+        file.write_all(report.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&staged, &path)?;
+        let family = if name.ends_with(".json") {
+            ("setup-run-", ".json")
+        } else {
+            ("setup-", ".txt")
+        };
+        let mut old: Vec<_> = fs::read_dir(root)?
+            .filter_map(Result::ok)
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with(family.0)
+                    && name.ends_with(family.1)
+                    && name[family.0.len()..name.len() - family.1.len()]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || b == b'-')
+                    && e.file_type().is_ok_and(|t| t.is_file() && !t.is_symlink())
+            })
+            .map(|e| e.path())
+            .collect();
+        old.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        for p in old.into_iter().skip(10) {
+            let _ = fs::remove_file(p);
+        }
+        Ok(path)
+    }
+    if report.len() > 5 * 1024 * 1024 {
+        return Err(std::io::Error::other(
+            "Setup report exceeds the bounded 5 MiB limit",
+        ));
+    }
+    let central = workspace_service::application_paths::log_root("diagnostics")
+        .and_then(|p| write(&p, name, report));
+    match central {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let fallback = env::temp_dir().join("CodeCodex-Diagnostics");
+            let report = if name.ends_with(".json") {
+                let mut v: serde_json::Value =
+                    serde_json::from_str(report).map_err(std::io::Error::other)?;
+                v["diagnosticStorageFallback"] =
+                    json!({"centralError":e.to_string(),"systemTemp":true});
+                serde_json::to_string_pretty(&v).map_err(std::io::Error::other)?
+            } else {
+                format!(
+                    "{report}\nDiagnostic storage fallback: central directory unavailable: {e}; using system temporary folder.\n"
+                )
+            };
+            write(&fallback, name, &report)
+        }
+    }
+}
+
+fn save_session(journal: &SetupJournal, outcome: &str) {
+    let mut snapshot = journal.snapshot();
+    snapshot["version"] = json!(env!("CARGO_PKG_VERSION"));
+    snapshot["outcome"] = json!(outcome);
+    if let Ok(Some(root)) = workspace_service::application_paths::install_root() {
+        let since = snapshot["runId"]
+            .as_str()
+            .and_then(|v| v.split('-').next())
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(u128::MAX);
+        let folder = root.join("logs/install");
+        if workspace_service::application_paths::validate_directory_path(&folder).is_ok()
+            && let Ok(entries) = fs::read_dir(folder)
+        {
+            let mut paths: Vec<_> = entries
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("install-"))
+                .map(|e| e.path())
+                .collect();
+            paths.sort();
+            for path in paths.into_iter().rev().take(10) {
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.file_attributes() & 0x400 != 0 {
+                        continue;
+                    }
+                }
+                if !meta.is_file()
+                    || meta.len() > 128 * 1024
+                    || meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .is_none_or(|t| t.as_millis() < since)
+                {
+                    continue;
+                }
+                if let Ok(bytes) = fs::read(&path)
+                    && let Ok(report) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    && report["version"] == env!("CARGO_PKG_VERSION")
+                {
+                    snapshot["installerTransactionReport"] = report;
+                    break;
+                }
+            }
+        }
+    }
+    let name = format!(
+        "setup-run-{}.json",
+        snapshot["runId"].as_str().unwrap_or("unknown")
+    );
+    let text = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
+    if let Err(e) = save_report_file(&name, &text) {
+        journal.event(
+            "session log",
+            "save failed",
+            json!({"reason":e.to_string(),"osCode":e.raw_os_error()}),
+        );
+        eprintln!("Setup session could not be saved: {e}");
+    }
+}
+
+fn deliver_failure(progress: &mut gui_support::ProgressDialog, detail: &str, installed: bool) {
+    let journal = progress.journal();
+    journal.event(
+        "setup failure",
+        "observed",
+        json!({"installationSucceeded":installed,"originalError":detail}),
+    );
+    save_session(
+        &journal,
+        if installed {
+            "completion UI failed"
+        } else {
+            "failed; checking"
+        },
+    );
+    progress.checking();
+    match gui_support::trusted_system32_powershell() {
+        Ok(shell) => {
+            let mut command = Command::new(shell);
+            let script = format!(
+                "{}\n{}",
+                include_str!("../setup-checks.ps1"),
+                include_str!("../support-checks.ps1")
+            );
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ]);
+            // Locator comes from the verified product contract, never arbitrary arguments.
+            match workspace_service::application_paths::install_root() {
+                Ok(Some(root)) => {
+                    command.env("CLE_CHECK_INSTALL_ROOT", root);
+                }
+                other => {
+                    journal.event("self-check locator","default-location observation",json!({"reason":format!("{other:?}"),"interpretation":"Default folder is auxiliary evidence, not the rejected custom installation target"}));
+                    command.env(
+                        "CLE_CHECK_INSTALL_ROOT",
+                        env::var_os("LOCALAPPDATA")
+                            .map(PathBuf::from)
+                            .unwrap_or_else(env::temp_dir)
+                            .join("Programs/Code-Codex"),
+                    );
+                }
+            }
+            let _ = bounded_checks(command, &journal, Duration::from_secs(10));
+        }
+        Err(e) => journal.event(
+            "automatic installation checks",
+            "unavailable",
+            json!({"reason":e}),
+        ),
+    }
+    let report = format!(
+        "Code-Codex installation diagnostic\nVersion: {}\nInstallation succeeded: {installed}\n\nOriginal error:\n{detail}\n\nInstaller and UI process observations (automatic checks are auxiliary evidence, not proof of causation):\n{}\n\nUnobserved: security-product private policy, kernel-blocked filesystem I/O, original network phase timings, full crash dumps.\n",
+        env!("CARGO_PKG_VERSION"),
+        journal.text()
+    );
+    let id = journal.snapshot()["runId"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_owned();
+    let saved = save_report_file(&format!("setup-{id}.txt"), &report);
+    let path = saved.as_ref().ok().map(|p| p.as_path());
+    let visible = match &saved {
+        Ok(path) => format!(
+            "{}\n\nFull diagnostic report: {}",
+            report.chars().take(1000).collect::<String>(),
+            path.display()
+        ),
+        Err(e) => format!(
+            "{}\nDiagnostic report could not be saved: {e}",
+            report.chars().take(1000).collect::<String>()
+        ),
+    };
+    if let Err(e) = progress.show_report(&report, path) {
+        journal.event("diagnostic window", "fallback", json!({"reason":e}));
+        progress.close();
+        save_session(
+            &journal,
+            if installed {
+                "installed; diagnostic fallback"
+            } else {
+                "failed; diagnostic fallback"
+            },
+        );
+        gui_support::show_dialog(TITLE, &visible, true);
+    } else {
+        progress.close();
+    }
+    // Include copy/open/close and final cleanup in the saved report, while retaining
+    // the same original error and completed check observations.
+    let final_report = format!(
+        "{report}\nFinal report delivery and cleanup observations:\n{}",
+        journal.text()
+    );
+    let _ = save_report_file(&format!("setup-{id}.txt"), &final_report);
+    save_session(
+        &journal,
+        if installed {
+            "installed; completion UI failed"
+        } else {
+            "failed"
+        },
+    );
+}
+
+fn run_setup(
+    arguments: &[OsString],
+    progress: &mut gui_support::ProgressDialog,
+) -> Result<Output, String> {
+    progress.set_progress_detail(
+        15,
+        "Checking setup package",
+        "Locating the installer payload.",
+    );
+    let executable = env::current_exe()
+        .map_err(|error| format!("the setup executable could not be located: {error}"))?;
+    let source = inspect_setup_source(&executable)?;
+    progress.journal().event(
+        "setup package",
+        "validated",
+        json!({"source":format!("{source:?}")}),
+    );
+    match source {
+        SetupSource::Embedded {
+            payload_offset,
+            payload_length,
+            executable_length,
+        } => run_embedded_setup(
+            &executable,
+            payload_offset,
+            payload_length,
+            executable_length,
+            arguments,
+            progress,
+        ),
+        SetupSource::Sibling => {
+            progress.set_progress_detail(
+                60,
+                "Starting installation",
+                "Validating the installed Codex integration.",
+            );
+            script_wrapper::run_sibling_script_with_progress(
+                INSTALL_SCRIPT,
+                arguments.iter().cloned(),
+                progress,
+            )?
+            .ok_or_else(|| {
+                "CC-INSTALL-SCRIPT-MISSING-001: The plain setup program requires Install-CodeCodex.ps1 next to it".to_owned()
+            })
+        }
+    }
+}
+
+fn run_embedded_setup(
+    executable: &Path,
+    payload_offset: u64,
+    payload_length: u64,
+    executable_length: u64,
+    arguments: &[OsString],
+    progress: &mut gui_support::ProgressDialog,
+) -> Result<Output, String> {
+    let temporary_directory = tempfile::Builder::new()
+        .prefix("CodeCodex-Setup-")
+        .tempdir_in(
+            workspace_service::application_paths::temp_root()
+                .unwrap_or_else(|_| std::env::temp_dir()),
+        )
+        .map_err(|error| format!("CC-INSTALL-TEMP-001: A temporary setup directory could not be created: {error}"))?;
+    let archive = temporary_directory.path().join("payload.zip");
+    progress.set_progress_detail(
+        25,
+        "Extracting package",
+        "Reading the installer files from the setup executable.",
+    );
+    extract_embedded_archive(
+        executable,
+        &archive,
+        payload_offset,
+        payload_length,
+        executable_length,
+    )?;
+
+    progress.set_progress_detail(
+        40,
+        "Expanding package",
+        "Preparing the installation files in a temporary folder.",
+    );
+    expand_archive(&archive, temporary_directory.path())?;
+    progress.set_progress_detail(
+        60,
+        "Starting installation",
+        "Validating the installed Codex integration.",
+    );
+    let installer = find_extracted_installer(temporary_directory.path())?;
+    script_wrapper::run_script_with_progress(&installer, arguments.iter().cloned(), progress)
+}
+
+fn format_setup_failure(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = sanitize_script_output(stdout);
+    let stderr = sanitize_script_output(stderr);
+    let mut sections = Vec::new();
+    let structured = stdout.lines().find_map(|line| {
+        serde_json::from_str::<InstallErrorReport>(line.strip_prefix(INSTALL_ERROR_PREFIX)?).ok()
+    });
+    if let Some(report) = structured {
+        sections.push(format!("Support code: {}\nInstallation committed: {}\nRollback result: {}", if report.code.is_empty(){"CC-INSTALL-UNCLASSIFIED-001"}else{&report.code}, report.installation_committed, report.rollback));
+        let decoded_message = base64::engine::general_purpose::STANDARD
+            .decode(&report.message_base64)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| "Localized error text could not be decoded".to_owned());
+        sections.push(format!(
+            "Installation stage: {}\nOperation: {}\nTarget: {} (exists: {})\nAttempt: {}\nException: {}\nHRESULT: {}\nWin32 code: {}\nScript line: {}\nReason: {}",
+            report.stage,
+            report.operation,
+            report.target_name,
+            report.target_exists.map_or("unknown".to_owned(), |exists| exists.to_string()),
+            report.attempt,
+            report.exception,
+            report.hresult,
+            report.win32.map_or("unknown".to_owned(), |code| code.to_string()),
+            report.line.map_or("unknown".to_owned(), |line| line.to_string()),
+            decoded_message,
+        ));
+    }
+    if let Some(report) = stdout.lines().find_map(|line| {
+        serde_json::from_str::<InstallErrorReport>(line.strip_prefix(INSTALL_ERROR_PREFIX)?).ok()
+    }) {
+        sections.push(format!("Error category: {}\nError ID: {}\nInstaller process environment:\n{}\nInstaller timeline:\n{}\nException chain (UTF-8 messages encoded in Base64):\n{}",report.category,report.error_id,serde_json::to_string_pretty(&report.process_environment).unwrap_or_default(),serde_json::to_string_pretty(&report.timeline).unwrap_or_default(),serde_json::to_string_pretty(&report.exception_chain).unwrap_or_default()));
+    }
+    if !stderr.is_empty() {
+        sections.push(format!("PowerShell error:\n{stderr}"));
+    }
+    let remaining_output = stdout
+        .lines()
+        .filter(|line| !line.starts_with(INSTALL_ERROR_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !remaining_output.is_empty() {
+        sections.push(format!("Installer output:\n{remaining_output}"));
+    }
+    let exit_detail = exit_code.map_or_else(
+        || "without an exit code".to_owned(),
+        |code| format!("with exit code {code}"),
+    );
+    if sections.is_empty() {
+        return format!(
+            "Windows PowerShell exited {exit_detail} and did not provide diagnostic output."
+        );
+    }
+    let diagnostic = truncate_diagnostic(sections.join("\n\n"));
+    format!("{diagnostic}\n\nWindows PowerShell exited {exit_detail}.")
+}
+
+fn sanitize_script_output(bytes: &[u8]) -> String {
+    let decoded = if bytes.starts_with(&[0xff, 0xfe]) {
+        decode_utf16_le(&bytes[2..])
+    } else if looks_like_utf16_le(bytes) {
+        decode_utf16_le(bytes)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    decoded
+        .trim_start_matches('\u{feff}')
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn looks_like_utf16_le(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || bytes.len() % 2 != 0 {
+        return false;
+    }
+    let pairs = bytes.chunks_exact(2).take(64);
+    let mut count = 0usize;
+    let mut zero_high_bytes = 0usize;
+    for pair in pairs {
+        count += 1;
+        if pair[1] == 0 {
+            zero_high_bytes += 1;
+        }
+    }
+    count > 0 && zero_high_bytes * 4 >= count * 3
+}
+
+fn decode_utf16_le(bytes: &[u8]) -> String {
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
+}
+
+fn truncate_diagnostic(text: String) -> String {
+    if text.chars().count() <= MAX_SCRIPT_DIAGNOSTIC_CHARS {
+        return text;
+    }
+    let keep = MAX_SCRIPT_DIAGNOSTIC_CHARS.saturating_sub(TRUNCATION_MARKER.chars().count());
+    let mut truncated = text.chars().take(keep).collect::<String>();
+    truncated.push_str(TRUNCATION_MARKER);
+    truncated
+}
+
+fn inspect_setup_source(executable: &Path) -> Result<SetupSource, String> {
+    let bytes = fs::read(executable)
+        .map_err(|error| format!("the setup executable could not be read: {error}"))?;
+    classify_setup_source(&bytes)
+}
+
+fn classify_setup_source(executable: &[u8]) -> Result<SetupSource, String> {
+    let layout = portable_executable_layout(executable)?;
+    let file_length = u64::try_from(executable.len())
+        .map_err(|_| "the setup executable is too large".to_owned())?;
+    let stub_length = u64::try_from(layout.image_end)
+        .map_err(|_| "the setup executable is too large".to_owned())?;
+    let footer_end = match layout.certificate_range {
+        None if executable.len() == layout.image_end => return Ok(SetupSource::Sibling),
+        None => executable.len(),
+        Some((certificate_start, certificate_end)) => {
+            if certificate_end != executable.len() {
+                return Err(
+                    "the setup program certificate table does not end at the end of the file"
+                        .to_owned(),
+                );
+            }
+            match footer_end_before_certificate(executable, certificate_start) {
+                Some(footer_end) => footer_end,
+                None if is_zero_alignment_padding(
+                    executable,
+                    layout.image_end,
+                    certificate_start,
+                ) =>
+                {
+                    return Ok(SetupSource::Sibling);
+                }
+                None => {
+                    return Err(
+                        "the appended installer payload has a missing or invalid footer".to_owned(),
+                    );
+                }
+            }
+        }
+    };
+    let footer_start = footer_end
+        .checked_sub(FOOTER_LENGTH as usize)
+        .ok_or_else(|| "the embedded installer footer is truncated".to_owned())?;
+    let footer_end_u64 =
+        u64::try_from(footer_end).map_err(|_| "the setup executable is too large".to_owned())?;
+    let (payload_offset, payload_length) =
+        parse_footer(&executable[footer_start..footer_end], footer_end_u64)?;
+    if payload_offset != stub_length {
+        return Err(
+            "the embedded installer payload does not begin at the end of the setup program"
+                .to_owned(),
+        );
+    }
+    Ok(SetupSource::Embedded {
+        payload_offset,
+        payload_length,
+        executable_length: file_length,
+    })
+}
+
+fn footer_end_before_certificate(executable: &[u8], certificate_start: usize) -> Option<usize> {
+    (0..=7).find_map(|padding_length| {
+        let footer_end = certificate_start.checked_sub(padding_length)?;
+        let footer_start = footer_end.checked_sub(FOOTER_LENGTH as usize)?;
+        if executable
+            .get(footer_end..certificate_start)?
+            .iter()
+            .all(|byte| *byte == 0)
+            && executable.get(footer_start..footer_start + FOOTER_MAGIC.len())? == FOOTER_MAGIC
+        {
+            Some(footer_end)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_zero_alignment_padding(executable: &[u8], start: usize, end: usize) -> bool {
+    let Some(length) = end.checked_sub(start) else {
+        return false;
+    };
+    length <= 7
+        && executable
+            .get(start..end)
+            .is_some_and(|padding| padding.iter().all(|byte| *byte == 0))
+}
+
+fn portable_executable_layout(executable: &[u8]) -> Result<PortableExecutableLayout, String> {
+    if executable.get(..2) != Some(b"MZ") {
+        return Err("the setup program is not a valid Windows executable".to_owned());
+    }
+    let pe_offset = read_u32(executable, 0x3c)? as usize;
+    let coff = checked_slice(executable, pe_offset, 24)?;
+    if coff.get(..4) != Some(b"PE\0\0") {
+        return Err("the setup program has an invalid PE signature".to_owned());
+    }
+    let section_count = usize::from(u16::from_le_bytes([coff[6], coff[7]]));
+    if section_count == 0 || section_count > 96 {
+        return Err("the setup program has an invalid PE section count".to_owned());
+    }
+    let optional_length = usize::from(u16::from_le_bytes([coff[20], coff[21]]));
+    let optional_offset = pe_offset
+        .checked_add(24)
+        .ok_or_else(|| "the setup program PE headers overflow".to_owned())?;
+    let optional = checked_slice(executable, optional_offset, optional_length)?;
+    if optional.len() < 64 {
+        return Err("the setup program has a truncated PE optional header".to_owned());
+    }
+    let magic = u16::from_le_bytes([optional[0], optional[1]]);
+    let (directory_count_offset, directory_offset) = match magic {
+        0x10b => (92usize, 96usize),
+        0x20b => (108usize, 112usize),
+        _ => return Err("the setup program has an unsupported PE optional header".to_owned()),
+    };
+
+    let section_table_offset = optional_offset
+        .checked_add(optional_length)
+        .ok_or_else(|| "the setup program PE headers overflow".to_owned())?;
+    let section_table_length = section_count
+        .checked_mul(40)
+        .ok_or_else(|| "the setup program PE section table overflows".to_owned())?;
+    let sections = checked_slice(executable, section_table_offset, section_table_length)?;
+    let mut image_end = usize::try_from(read_u32(optional, 60)?)
+        .map_err(|_| "the setup program PE headers are too large".to_owned())?;
+    for section in sections.chunks_exact(40) {
+        let raw_length = usize::try_from(u32::from_le_bytes([
+            section[16],
+            section[17],
+            section[18],
+            section[19],
+        ]))
+        .map_err(|_| "the setup program PE section is too large".to_owned())?;
+        let raw_offset = usize::try_from(u32::from_le_bytes([
+            section[20],
+            section[21],
+            section[22],
+            section[23],
+        ]))
+        .map_err(|_| "the setup program PE section offset is too large".to_owned())?;
+        let section_end = raw_offset
+            .checked_add(raw_length)
+            .ok_or_else(|| "the setup program PE section range overflows".to_owned())?;
+        image_end = image_end.max(section_end);
+    }
+
+    let mut certificate_range = None;
+    if optional.len() >= directory_count_offset + 4 {
+        let directory_count = read_u32(optional, directory_count_offset)?;
+        if directory_count > 4 && optional.len() >= directory_offset + 40 {
+            let certificate_offset = usize::try_from(read_u32(optional, directory_offset + 32)?)
+                .map_err(|_| "the setup program certificate offset is too large".to_owned())?;
+            let certificate_length = usize::try_from(read_u32(optional, directory_offset + 36)?)
+                .map_err(|_| "the setup program certificate is too large".to_owned())?;
+            if certificate_offset != 0 || certificate_length != 0 {
+                if certificate_offset == 0 || certificate_length == 0 {
+                    return Err("the setup program has an invalid PE certificate range".to_owned());
+                }
+                let certificate_end = certificate_offset
+                    .checked_add(certificate_length)
+                    .ok_or_else(|| "the setup program certificate range overflows".to_owned())?;
+                if certificate_offset < image_end {
+                    return Err(
+                        "the setup program certificate table overlaps the PE image".to_owned()
+                    );
+                }
+                if certificate_end > executable.len() {
+                    return Err("the setup program has a truncated PE certificate table".to_owned());
+                }
+                certificate_range = Some((certificate_offset, certificate_end));
+            }
+        }
+    }
+    if image_end == 0 || image_end > executable.len() {
+        return Err("the setup program has a truncated PE image".to_owned());
+    }
+    Ok(PortableExecutableLayout {
+        image_end,
+        certificate_range,
+    })
+}
+
+fn checked_slice(bytes: &[u8], offset: usize, length: usize) -> Result<&[u8], String> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| "the setup program PE range overflows".to_owned())?;
+    bytes
+        .get(offset..end)
+        .ok_or_else(|| "the setup program has truncated PE headers".to_owned())
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+    let value = checked_slice(bytes, offset, 4)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn extract_embedded_archive(
+    executable: &Path,
+    destination: &Path,
+    payload_offset: u64,
+    payload_length: u64,
+    executable_length: u64,
+) -> Result<(), String> {
+    let mut source = File::open(executable)
+        .map_err(|error| format!("the setup executable could not be read: {error}"))?;
+    let file_length = source
+        .metadata()
+        .map_err(|error| format!("the setup executable size could not be read: {error}"))?
+        .len();
+    let payload_end = payload_offset
+        .checked_add(payload_length)
+        .ok_or_else(|| "the embedded installer payload range overflows".to_owned())?;
+    if file_length != executable_length {
+        return Err("the setup executable changed while its payload was being opened".to_owned());
+    }
+    let footer_end = payload_end
+        .checked_add(FOOTER_LENGTH)
+        .ok_or_else(|| "the embedded installer footer range overflows".to_owned())?;
+    if footer_end > file_length {
+        return Err("the setup executable changed while its payload was being opened".to_owned());
+    }
+
+    source
+        .seek(SeekFrom::Start(payload_end))
+        .map_err(|error| format!("the embedded installer footer could not be read: {error}"))?;
+    let mut footer = [0_u8; FOOTER_LENGTH as usize];
+    source
+        .read_exact(&mut footer)
+        .map_err(|error| format!("the embedded installer footer could not be read: {error}"))?;
+    if parse_footer(&footer, footer_end)? != (payload_offset, payload_length) {
+        return Err("the setup executable changed while its payload was being opened".to_owned());
+    }
+
+    source
+        .seek(SeekFrom::Start(payload_offset))
+        .map_err(|error| format!("the embedded installer payload could not be read: {error}"))?;
+    let mut output = File::create(destination).map_err(|error| {
+        format!("CC-INSTALL-ARCHIVE-WRITE-001: The temporary installer archive could not be created: {error}")
+    })?;
+    let copied = std::io::copy(&mut source.take(payload_length), &mut output).map_err(|error| {
+        format!("CC-INSTALL-PAYLOAD-READ-001: The embedded installer payload could not be extracted: {error}")
+    })?;
+    if copied != payload_length {
+        return Err("the embedded installer payload is truncated".to_owned());
+    }
+    output.flush().map_err(|error| {
+        format!("the temporary installer archive could not be written: {error}")
+    })?;
+    Ok(())
+}
+
+fn parse_footer(footer: &[u8], file_length: u64) -> Result<(u64, u64), String> {
+    if footer.len() != FOOTER_LENGTH as usize || &footer[..8] != FOOTER_MAGIC {
+        return Err(
+            "the embedded installer payload is missing or has an invalid footer".to_owned(),
+        );
+    }
+    let mut offset_bytes = [0_u8; 8];
+    offset_bytes.copy_from_slice(&footer[8..16]);
+    let mut length_bytes = [0_u8; 8];
+    length_bytes.copy_from_slice(&footer[16..24]);
+    let offset = u64::from_le_bytes(offset_bytes);
+    let length = u64::from_le_bytes(length_bytes);
+    let payload_end = offset
+        .checked_add(length)
+        .ok_or_else(|| "the embedded installer payload range overflows".to_owned())?;
+    let expected_end = file_length
+        .checked_sub(FOOTER_LENGTH)
+        .ok_or_else(|| "the embedded installer footer is truncated".to_owned())?;
+    if offset == 0 || length == 0 || payload_end != expected_end {
+        return Err("the embedded installer payload range is invalid".to_owned());
+    }
+    Ok((offset, length))
+}
+
+fn expand_archive(archive: &Path, destination: &Path) -> Result<(), String> {
+    let powershell = gui_support::trusted_system32_powershell()?;
+    let mut command = Command::new(powershell);
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            EXPAND_ARCHIVE_SCRIPT,
+        ])
+        .env("CLE_ARCHIVE_PATH", archive)
+        .env("CLE_DESTINATION_PATH", destination)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    gui_support::configure_hidden(&mut command);
+    let output = command.output().map_err(|error| {
+        format!("CC-INSTALL-EXPAND-001: The embedded installer archive could not be expanded: {error}")
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "CC-INSTALL-EXPAND-001: The embedded installer archive could not be expanded:\n\n{}",
+            format_setup_failure(output.status.code(), &output.stdout, &output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn find_extracted_installer(extraction_root: &Path) -> Result<PathBuf, String> {
+    let direct = extraction_root.join(INSTALL_SCRIPT);
+    if direct.is_file() {
+        return verify_extracted_installer(extraction_root, &direct);
+    }
+
+    let mut candidates = Vec::new();
+    let entries = extraction_root.read_dir().map_err(|error| {
+        format!("the expanded installer payload could not be inspected: {error}")
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("the expanded installer payload could not be inspected: {error}")
+        })?;
+        let candidate = entry.path().join(INSTALL_SCRIPT);
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+    }
+    if candidates.len() != 1 {
+        return Err("the embedded archive must contain exactly one installer script at its root or in one top-level directory".to_owned());
+    }
+    verify_extracted_installer(extraction_root, &candidates[0])
+}
+
+fn verify_extracted_installer(extraction_root: &Path, installer: &Path) -> Result<PathBuf, String> {
+    let root = dunce::canonicalize(extraction_root).map_err(|error| {
+        format!("the temporary installer directory could not be verified: {error}")
+    })?;
+    let installer = dunce::canonicalize(installer).map_err(|error| {
+        format!("the extracted installer script could not be verified: {error}")
+    })?;
+    if !installer.is_file() || !installer.starts_with(&root) {
+        return Err(
+            "the extracted installer script resolves outside the temporary directory".to_owned(),
+        );
+    }
+    Ok(installer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_setup_waits_for_selection_but_automatic_update_does_not() {
+        assert!(wants_setup_selection(&[], false));
+        assert!(wants_setup_selection(&["-UiLanguage".into(),"en".into()],false));
+        assert_eq!(requested_ui_language(&["-UiLanguage".into(),"en".into()]).unwrap(),Some(workspace_service::ui_language::Locale::English));
+        assert!(requested_ui_language(&["-UiLanguage".into()]).is_err());
+        assert!(requested_ui_language(&["-UiLanguage".into(),"fr".into()]).is_err());
+        assert!(requested_ui_language(&["-UiLanguage".into(),"en".into(),"-UiLanguage".into(),"zh-CN".into()]).is_err());
+        assert!(!wants_setup_selection(&[], true));
+        assert!(!wants_setup_selection(&["-NoActivate".into()], false));
+        assert!(wants_setup_selection(&["-selectdirectory".into()], false));
+    }
+
+    #[test]
+    fn selected_root_is_forwarded_once_without_second_directory_prompt() {
+        let before = vec![
+            "-SelectDirectory".into(),
+            "-InstallRoot".into(),
+            "C:\\Old".into(),
+            "-NoActivate".into(),
+            "-Version".into(),
+            "0.4.13".into(),
+        ];
+        let root = OsString::from("E:\\自定义 Apps\\Code-Codex");
+        assert_eq!(
+            explicit_install_root(&before),
+            Some(std::ffi::OsStr::new("C:\\Old"))
+        );
+        assert_eq!(
+            selected_install_arguments(&before, root.clone()),
+            vec![
+                OsString::from("-NoActivate"),
+                "-Version".into(),
+                "0.4.13".into(),
+                "-InstallRoot".into(),
+                root
+            ]
+        );
+    }
+
+    const PE_OFFSET: usize = 0x80;
+    const OPTIONAL_LENGTH: usize = 0xf0;
+    const OPTIONAL_OFFSET: usize = PE_OFFSET + 24;
+    const SECURITY_DIRECTORY_OFFSET: usize = OPTIONAL_OFFSET + 112 + 32;
+
+    fn plain_pe() -> Vec<u8> {
+        const RAW_OFFSET: usize = 0x200;
+        const RAW_LENGTH: usize = 0x200;
+        let mut executable = vec![0_u8; RAW_OFFSET + RAW_LENGTH];
+        executable[..2].copy_from_slice(b"MZ");
+        executable[0x3c..0x40].copy_from_slice(&(PE_OFFSET as u32).to_le_bytes());
+        executable[PE_OFFSET..PE_OFFSET + 4].copy_from_slice(b"PE\0\0");
+        executable[PE_OFFSET + 6..PE_OFFSET + 8].copy_from_slice(&1_u16.to_le_bytes());
+        executable[PE_OFFSET + 20..PE_OFFSET + 22]
+            .copy_from_slice(&(OPTIONAL_LENGTH as u16).to_le_bytes());
+        let optional = PE_OFFSET + 24;
+        executable[optional..optional + 2].copy_from_slice(&0x20b_u16.to_le_bytes());
+        executable[optional + 60..optional + 64]
+            .copy_from_slice(&(RAW_OFFSET as u32).to_le_bytes());
+        executable[optional + 108..optional + 112].copy_from_slice(&16_u32.to_le_bytes());
+        let section = optional + OPTIONAL_LENGTH;
+        executable[section + 16..section + 20].copy_from_slice(&(RAW_LENGTH as u32).to_le_bytes());
+        executable[section + 20..section + 24].copy_from_slice(&(RAW_OFFSET as u32).to_le_bytes());
+        executable
+    }
+
+    fn append_test_certificate(executable: &mut Vec<u8>) -> (usize, usize) {
+        const CERTIFICATE_LENGTH: usize = 16;
+        let padding_length = (8 - executable.len() % 8) % 8;
+        executable.resize(executable.len() + padding_length, 0);
+        let certificate_start = executable.len();
+        let mut certificate = [0_u8; CERTIFICATE_LENGTH];
+        certificate[..4].copy_from_slice(&(CERTIFICATE_LENGTH as u32).to_le_bytes());
+        certificate[4..6].copy_from_slice(&0x0200_u16.to_le_bytes());
+        certificate[6..8].copy_from_slice(&0x0002_u16.to_le_bytes());
+        executable.extend_from_slice(&certificate);
+        executable[SECURITY_DIRECTORY_OFFSET..SECURITY_DIRECTORY_OFFSET + 4]
+            .copy_from_slice(&(certificate_start as u32).to_le_bytes());
+        executable[SECURITY_DIRECTORY_OFFSET + 4..SECURITY_DIRECTORY_OFFSET + 8]
+            .copy_from_slice(&(CERTIFICATE_LENGTH as u32).to_le_bytes());
+        (certificate_start, executable.len())
+    }
+
+    fn footer(offset: u64, length: u64) -> [u8; FOOTER_LENGTH as usize] {
+        let mut result = [0_u8; FOOTER_LENGTH as usize];
+        result[..8].copy_from_slice(FOOTER_MAGIC);
+        result[8..16].copy_from_slice(&offset.to_le_bytes());
+        result[16..24].copy_from_slice(&length.to_le_bytes());
+        result
+    }
+
+    #[test]
+    fn parses_an_exact_end_of_file_payload_range() {
+        assert_eq!(
+            parse_footer(&footer(1_024, 4_096), 5_144),
+            Ok((1_024, 4_096))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_payload_ranges() {
+        let mut invalid_magic = footer(1_024, 4_096);
+        invalid_magic[0] = b'X';
+        assert!(parse_footer(&invalid_magic, 5_144).is_err());
+        assert!(parse_footer(&footer(0, 4_096), 4_120).is_err());
+        assert!(parse_footer(&footer(1_024, 0), 1_048).is_err());
+        assert!(parse_footer(&footer(1_024, 4_095), 5_144).is_err());
+        assert!(parse_footer(&footer(u64::MAX, 1), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn plain_pe_selects_sibling_mode_only_without_an_overlay() {
+        assert_eq!(classify_setup_source(&plain_pe()), Ok(SetupSource::Sibling));
+    }
+
+    #[test]
+    fn valid_appended_payload_selects_embedded_mode() {
+        let mut executable = plain_pe();
+        let offset = executable.len() as u64;
+        let payload = b"PK\x03\x04embedded archive";
+        executable.extend_from_slice(payload);
+        executable.extend_from_slice(&footer(offset, payload.len() as u64));
+        let executable_length = executable.len() as u64;
+
+        assert_eq!(
+            classify_setup_source(&executable),
+            Ok(SetupSource::Embedded {
+                payload_offset: offset,
+                payload_length: payload.len() as u64,
+                executable_length,
+            })
+        );
+    }
+
+    #[test]
+    fn signed_plain_pe_still_selects_sibling_mode() {
+        let mut executable = plain_pe();
+        append_test_certificate(&mut executable);
+
+        assert_eq!(classify_setup_source(&executable), Ok(SetupSource::Sibling));
+    }
+
+    #[test]
+    fn signed_embedded_payload_is_classified_and_extracted() {
+        let mut executable = plain_pe();
+        let payload_offset = executable.len() as u64;
+        let payload = b"PK\x03\x04signed embedded archive";
+        executable.extend_from_slice(payload);
+        executable.extend_from_slice(&footer(payload_offset, payload.len() as u64));
+        let footer_end = executable.len();
+        let (certificate_start, _) = append_test_certificate(&mut executable);
+        assert!((1..=7).contains(&(certificate_start - footer_end)));
+
+        let executable_length = executable.len() as u64;
+        let source = classify_setup_source(&executable);
+        assert_eq!(
+            source,
+            Ok(SetupSource::Embedded {
+                payload_offset,
+                payload_length: payload.len() as u64,
+                executable_length,
+            })
+        );
+
+        let temporary_directory = tempfile::tempdir().expect("temporary directory");
+        let setup = temporary_directory.path().join("signed-setup.exe");
+        let archive = temporary_directory.path().join("payload.zip");
+        fs::write(&setup, &executable).expect("write signed setup fixture");
+        extract_embedded_archive(
+            &setup,
+            &archive,
+            payload_offset,
+            payload.len() as u64,
+            executable_length,
+        )
+        .expect("extract signed embedded payload");
+        assert_eq!(fs::read(archive).expect("read extracted payload"), payload);
+    }
+
+    #[test]
+    fn certificate_table_must_be_the_final_file_region() {
+        let mut executable = plain_pe();
+        append_test_certificate(&mut executable);
+        executable.extend_from_slice(b"unexpected trailing data");
+
+        let error = classify_setup_source(&executable).expect_err("trailing data must be rejected");
+        assert!(error.contains("does not end"));
+    }
+
+    #[test]
+    fn appended_data_with_a_missing_or_corrupt_footer_never_falls_back() {
+        let mut missing = plain_pe();
+        missing.extend_from_slice(b"appended payload without a footer");
+        assert!(classify_setup_source(&missing).is_err());
+
+        let mut corrupt = plain_pe();
+        let offset = corrupt.len() as u64;
+        let payload = b"PK\x03\x04embedded archive";
+        corrupt.extend_from_slice(payload);
+        let mut invalid_footer = footer(offset, payload.len() as u64);
+        invalid_footer[0] = b'X';
+        corrupt.extend_from_slice(&invalid_footer);
+        assert!(classify_setup_source(&corrupt).is_err());
+    }
+
+    #[test]
+    fn footer_cannot_hide_extra_data_between_the_stub_and_payload() {
+        let mut executable = plain_pe();
+        let stub_length = executable.len() as u64;
+        executable.extend_from_slice(b"unexpected prefix");
+        let payload_offset = executable.len() as u64;
+        let payload = b"PK\x03\x04embedded archive";
+        executable.extend_from_slice(payload);
+        executable.extend_from_slice(&footer(payload_offset, payload.len() as u64));
+
+        let error = classify_setup_source(&executable).expect_err("prefix must be rejected");
+        assert!(error.contains("does not begin"));
+        assert_ne!(payload_offset, stub_length);
+    }
+
+    #[test]
+    fn setup_failure_prioritizes_stderr_and_keeps_stdout_and_exit_code() {
+        let message = format_setup_failure(
+            Some(23),
+            b"preflight output",
+            b"specific installation error",
+        );
+
+        let error_position = message.find("specific installation error").expect("stderr");
+        let output_position = message.find("preflight output").expect("stdout");
+        let exit_position = message.find("exit code 23").expect("exit code");
+        assert!(error_position < output_position);
+        assert!(output_position < exit_position);
+        assert!(message.contains("PowerShell error:"));
+        assert!(message.contains("Installer output:"));
+    }
+
+    #[test]
+    fn setup_failure_uses_stdout_when_stderr_is_empty() {
+        let message = format_setup_failure(Some(1), b"installer-only detail", b"");
+
+        assert!(message.contains("Installer output:\ninstaller-only detail"));
+        assert!(!message.contains("PowerShell error:"));
+    }
+
+    #[test]
+    fn setup_failure_decodes_chinese_structured_error_without_codepage_loss() {
+        let reason = base64::engine::general_purpose::STANDARD.encode("文件正在使用中".as_bytes());
+        let report = format!(
+            "CODECODEX_INSTALL_ERROR:{{\"stage\":\"Installing application files\",\"operation\":\"Moving version directory\",\"targetName\":\"0.3.48\",\"targetExists\":false,\"attempt\":3,\"exception\":\"IOException\",\"hresult\":\"0x80070020\",\"win32\":32,\"line\":354,\"messageBase64\":\"{reason}\"}}"
+        );
+        let message = format_setup_failure(Some(1), report.as_bytes(), b"");
+        assert!(message.contains("文件正在使用中"));
+        assert!(message.contains("Win32 code: 32"));
+        assert!(message.contains("Moving version directory"));
+        assert!(!message.contains("messageBase64"));
+    }
+
+    #[test]
+    fn setup_failure_keeps_shortcut_tool_error_with_structured_report() {
+        let reason = base64::engine::general_purpose::STANDARD
+            .encode("The shortcut rollback state could not be prepared.".as_bytes());
+        let report = format!(
+            "CODECODEX_INSTALL_ERROR:{{\"stage\":\"Checking Codex integration\",\"operation\":\"Saving shortcut rollback state\",\"targetName\":\"\",\"targetExists\":null,\"attempt\":0,\"exception\":\"RuntimeException\",\"hresult\":\"0x80131501\",\"win32\":null,\"line\":395,\"messageBase64\":\"{reason}\"}}"
+        );
+        let message = format_setup_failure(
+            Some(1),
+            report.as_bytes(),
+            b"code-codex-shortcut: managed fallback shortcut is missing",
+        );
+        assert!(message.contains("The shortcut rollback state could not be prepared."));
+        assert!(message.contains("managed fallback shortcut is missing"));
+    }
+
+    #[test]
+    fn setup_failure_falls_back_when_powershell_is_silent() {
+        assert_eq!(
+            format_setup_failure(Some(1), b"", b""),
+            "Windows PowerShell exited with exit code 1 and did not provide diagnostic output."
+        );
+        assert!(format_setup_failure(None, b"", b"").contains("without an exit code"));
+    }
+
+    #[test]
+    fn setup_failure_sanitizes_utf16_newlines_nuls_and_invalid_utf8() {
+        let utf16 = "\u{feff}line one\r\nline two"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let message = format_setup_failure(Some(1), &[b'o', 0, b'k', 0], &utf16);
+
+        assert!(message.contains("line one\nline two"));
+        assert!(message.contains("Installer output:\nok"));
+        assert!(!message.contains('\0'));
+        assert!(!sanitize_script_output(&[0xff, b'e', 0, b'r', 0]).contains('\0'));
+    }
+
+    #[test]
+    fn setup_failure_bounds_long_diagnostics() {
+        let message = format_setup_failure(
+            Some(1),
+            b"",
+            &vec![b'x'; MAX_SCRIPT_DIAGNOSTIC_CHARS + 10_000],
+        );
+
+        assert!(message.contains(TRUNCATION_MARKER.trim()));
+        assert!(message.ends_with("Windows PowerShell exited with exit code 1."));
+        assert!(message.chars().count() <= MAX_SCRIPT_DIAGNOSTIC_CHARS + 80);
+    }
+}

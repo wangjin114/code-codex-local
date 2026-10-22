@@ -1,0 +1,1858 @@
+use std::collections::HashSet;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+#[cfg(windows)]
+use same_file::Handle as SameFileHandle;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::fs::{File, OpenOptions};
+#[cfg(windows)]
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::time::{Duration, Instant};
+#[cfg(windows)]
+use tempfile::{Builder as TempDirBuilder, TempDir};
+#[cfg(windows)]
+use windows_permissions::constants::{SeObjectType, SecurityInformation};
+#[cfg(windows)]
+use windows_permissions::{LocalBox, SecurityDescriptor};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    READ_CONTROL, WRITE_DAC,
+};
+
+use crate::process_guard::trusted_powershell;
+
+#[derive(Debug, Clone, Error)]
+pub enum DiscoveryError {
+    #[error("{operation}: {error}; {detail}")]
+    Context {
+        operation: &'static str,
+        detail: String,
+        #[source]
+        error: Box<DiscoveryError>,
+    },
+    #[error("Codex Desktop was not found")]
+    CodexNotFound,
+    #[error(
+        "Windows could not query the current user's Codex Desktop package registration ({step}: {code})"
+    )]
+    PackageQueryFailed { step: &'static str, code: String },
+    #[error("the official stable Codex Desktop package is not registered for this Windows user")]
+    StablePackageNotRegistered,
+    #[error(
+        "only Codex Beta is registered for this Windows user; the desktop shortcut requires stable Codex"
+    )]
+    StablePackageNotRegisteredBetaOnly,
+    #[error("the registered Codex Desktop package has an unexpected publisher or package identity")]
+    PackageIdentityRejected,
+    #[error(
+        "the registered Codex Desktop installation directory is missing or inaccessible ({code})"
+    )]
+    PackageLocationUnavailable { code: String },
+    #[error(
+        "the registered Codex Desktop package has no accessible ChatGPT or Codex application executable"
+    )]
+    PackageExecutableMissing,
+    #[error("the discovered Codex executable is invalid")]
+    InvalidExecutable,
+    #[error("the Codex App Server executable was not found")]
+    AppServerNotFound,
+}
+
+impl DiscoveryError {
+    pub fn context(self, operation: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self::Context {
+            operation,
+            detail: detail.to_string().chars().take(1024).collect(),
+            error: Box::new(self),
+        }
+    }
+    pub fn kind(&self) -> &Self {
+        match self {
+            Self::Context { error, .. } => error.kind(),
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ChannelPreference {
+    Any,
+    Stable,
+    Beta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexInstallation {
+    pub executable: PathBuf,
+    pub version: String,
+    pub channel: String,
+    pub source: DiscoverySource,
+    pub runtime_cache_unvirtualized: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_full_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_user_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_server: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscoverySource {
+    Explicit,
+    WindowsPackageManager,
+    UserInstall,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppServerSourceKind {
+    ExplicitDevelopmentOverride,
+    PackagedOfficial,
+}
+
+/// A read-only description of where an App Server would come from.
+///
+/// Source discovery is intentionally separate from launch preparation so the
+/// `diagnose` command never copies or materializes executable content.
+#[derive(Debug, Clone)]
+pub struct AppServerSource {
+    executable: PathBuf,
+    kind: AppServerSourceKind,
+}
+
+impl AppServerSource {
+    #[must_use]
+    pub fn kind(&self) -> AppServerSourceKind {
+        self.kind
+    }
+}
+
+/// The executable path prepared for one App Server process lifetime.
+///
+/// For an official package source, `_stage` owns the open executable and
+/// directory handles plus the transient directory. The App Server read loop
+/// retains this value through actual child stdout EOF, preventing replacement
+/// or adjacent-file creation for the complete child lifetime.
+#[derive(Debug)]
+pub struct AppServerLaunch {
+    executable: PathBuf,
+    #[cfg(windows)]
+    _stage: Option<StagedAppServer>,
+}
+
+impl AppServerLaunch {
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    #[must_use]
+    pub fn hardened_working_directory(&self) -> Option<&Path> {
+        #[cfg(windows)]
+        {
+            self._stage.as_ref()?.directory.as_ref().map(TempDir::path)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn sanitized_path(&self) -> Option<&std::ffi::OsStr> {
+        #[cfg(windows)]
+        {
+            self._stage
+                .as_ref()
+                .map(|stage| stage.trusted_path.as_os_str())
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct StagedAppServer {
+    executable_handle: Option<File>,
+    executable_acl_handle: Option<File>,
+    directory_handle: Option<File>,
+    ancestry_handles: Vec<File>,
+    directory: Option<TempDir>,
+    trusted_path: std::ffi::OsString,
+}
+
+#[cfg(windows)]
+impl Drop for StagedAppServer {
+    fn drop(&mut self) {
+        // Release the image lock, restore deletion rights through the retained
+        // ACL handle on partial-stage failures, then release the locked parent
+        // before asking TempDir to remove the tree.
+        self.executable_handle.take();
+        if let Some(handle) = self.executable_acl_handle.as_mut() {
+            let _ = set_protected_dacl(handle, "D:P(A;;FA;;;AU)(A;;FA;;;SY)(A;;FA;;;BA)");
+        }
+        self.executable_acl_handle.take();
+        self.directory_handle.take();
+        if let Some(directory) = self.directory.take() {
+            let _ = directory.close();
+        }
+        self.ancestry_handles.clear();
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PackageRecord {
+    name: String,
+    version: String,
+    install_location: String,
+    publisher: String,
+    package_family_name: String,
+    package_full_name: String,
+    #[serde(default)]
+    application_executable: Option<String>,
+    #[serde(default)]
+    runtime_cache_unvirtualized: bool,
+}
+
+pub fn discover_codex(
+    explicit: Option<&Path>,
+    explicit_version: Option<&str>,
+    preference: ChannelPreference,
+) -> Result<CodexInstallation, DiscoveryError> {
+    if let Some(executable) = explicit {
+        let executable = canonical_executable(executable)?;
+        return Ok(CodexInstallation {
+            executable,
+            version: explicit_version.unwrap_or("unknown").to_owned(),
+            channel: "custom".to_owned(),
+            source: DiscoverySource::Explicit,
+
+            runtime_cache_unvirtualized: false,
+            package_name: None,
+            package_full_name: None,
+            app_user_model_id: None,
+            app_server: None,
+        });
+    }
+
+    let mut package_error = DiscoveryError::CodexNotFound;
+    // AppX registration can be briefly unavailable while the official desktop
+    // app updates. Retry discovery once before reporting a persistent failure.
+    for attempt in 0..2 {
+        match discover_windows_packages(preference) {
+            Ok(mut packages) => {
+                packages.sort_by(|left, right| {
+                    channel_rank(&left.channel, preference)
+                        .cmp(&channel_rank(&right.channel, preference))
+                        .then_with(|| version_key(&right.version).cmp(&version_key(&left.version)))
+                });
+                if let Some(package) = packages.into_iter().next() {
+                    return Ok(package);
+                }
+            }
+            Err(error) => package_error = error,
+        }
+        if attempt == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    }
+
+    discover_user_install(preference).ok_or(package_error)
+}
+
+fn discover_windows_packages(
+    preference: ChannelPreference,
+) -> Result<Vec<CodexInstallation>, DiscoveryError> {
+    #[cfg(not(windows))]
+    {
+        let _ = preference;
+        Ok(Vec::new())
+    }
+    #[cfg(windows)]
+    {
+        select_package_installations(query_windows_package_records()?, preference)
+    }
+}
+
+#[cfg(windows)]
+fn select_package_installations(
+    records: Vec<PackageRecord>,
+    preference: ChannelPreference,
+) -> Result<Vec<CodexInstallation>, DiscoveryError> {
+    let has_beta = records
+        .iter()
+        .any(|record| record.name == "OpenAI.CodexBeta");
+    let mut installations = Vec::new();
+    let mut first_error = None;
+    let mut matched = false;
+    for record in records {
+        let channel = if record.name == "OpenAI.CodexBeta" {
+            "beta"
+        } else {
+            "stable"
+        };
+        if !channel_matches(channel, preference) {
+            continue;
+        }
+        matched = true;
+        match package_installation(record) {
+            Ok(installation) => installations.push(installation),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if !installations.is_empty() {
+        return Ok(installations);
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if !matched && preference == ChannelPreference::Stable {
+        return Err(if has_beta {
+            DiscoveryError::StablePackageNotRegisteredBetaOnly
+        } else {
+            DiscoveryError::StablePackageNotRegistered
+        });
+    }
+    Err(DiscoveryError::CodexNotFound)
+}
+
+#[cfg(windows)]
+fn query_windows_package_records() -> Result<Vec<PackageRecord>, DiscoveryError> {
+    const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); try { $packages=@(Get-AppxPackage -Name 'OpenAI.Codex*' -PackageTypeFilter Main -ErrorAction Stop | Where-Object { $_.Name -in @('OpenAI.Codex','OpenAI.CodexBeta') } | ForEach-Object { $package=$_; [xml]$manifest=Get-Content -LiteralPath (Join-Path $package.InstallLocation 'AppxManifest.xml') -Raw -ErrorAction Stop; $app=$manifest.SelectSingleNode("//*[local-name()='Application' and @Id='App']"); [pscustomobject]@{ Name=$package.Name;Version=[string]$package.Version;InstallLocation=$package.InstallLocation;Publisher=$package.Publisher;PackageFamilyName=$package.PackageFamilyName;PackageFullName=$package.PackageFullName;RuntimeCacheUnvirtualized=(@($manifest.SelectNodes('//*[local-name()="ExcludedDirectory" and namespace-uri()="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"]') | Where-Object { $_.InnerText.Trim() -eq '$(KnownFolder:LocalAppData)\OpenAI' }).Count -gt 0); ApplicationExecutable=$(if($app){[string]$app.Executable}else{''}) } }); ConvertTo-Json -InputObject $packages -Compress } catch { $failure=@{ errorId=[string]$_.FullyQualifiedErrorId; category=[string]$_.CategoryInfo.Category; hresult=[int]$_.Exception.HResult }; [Console]::Error.WriteLine((ConvertTo-Json -InputObject $failure -Compress)); exit 1 }"#;
+    let powershell = trusted_powershell().ok_or_else(|| DiscoveryError::PackageQueryFailed {
+        step: "locate PowerShell",
+        code: "trusted System32 PowerShell executable unavailable".to_owned(),
+    })?;
+    let output = Command::new(powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            SCRIPT,
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| DiscoveryError::PackageQueryFailed {
+            step: "start PowerShell",
+            code: windows_io_code(&error),
+        })?;
+    if !output.status.success() {
+        return Err(DiscoveryError::PackageQueryFailed {
+            step: "Get-AppxPackage",
+            code: package_query_exit_code(output.status.code(), &output.stderr),
+        });
+    }
+    if output.stdout.len() > 1024 * 1024 {
+        return Err(DiscoveryError::PackageQueryFailed {
+            step: "read package query output",
+            code: "output exceeded 1 MiB limit".to_owned(),
+        });
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(&output.stdout).map_err(|error| {
+        DiscoveryError::PackageQueryFailed {
+            step: "parse package query JSON",
+            code: format!(
+                "JSON error at line {}, column {}",
+                error.line(),
+                error.column()
+            ),
+        }
+    })?;
+    let records: Vec<PackageRecord> = match value {
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(|value| serde_json::from_value(value).map_err(package_record_error))
+            .collect::<Result<_, _>>()?,
+        value @ serde_json::Value::Object(_) => {
+            vec![serde_json::from_value(value).map_err(package_record_error)?]
+        }
+        _ => {
+            return Err(DiscoveryError::PackageQueryFailed {
+                step: "parse package query JSON",
+                code: "unexpected JSON shape".to_owned(),
+            });
+        }
+    };
+    Ok(records)
+}
+
+#[cfg(windows)]
+fn package_record_error(error: serde_json::Error) -> DiscoveryError {
+    DiscoveryError::PackageQueryFailed {
+        step: "parse package metadata",
+        code: format!(
+            "JSON metadata error: {}",
+            safe_code_token(&error.to_string())
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn windows_io_code(error: &std::io::Error) -> String {
+    error
+        .raw_os_error()
+        .map(|code| format!("Win32={code} (0x{code:08X})"))
+        .unwrap_or_else(|| format!("I/O kind={:?}", error.kind()))
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageQueryFailureRecord {
+    error_id: String,
+    category: String,
+    hresult: i32,
+}
+
+#[cfg(windows)]
+fn package_query_exit_code(exit_code: Option<i32>, stderr: &[u8]) -> String {
+    let mut parts = vec![format!(
+        "PowerShell exit={}",
+        exit_code.map_or("unknown".to_owned(), |code| code.to_string())
+    )];
+    if let Some(record) = std::str::from_utf8(stderr).ok().and_then(|output| {
+        output
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<PackageQueryFailureRecord>(line).ok())
+    }) {
+        parts.push(format!("HRESULT=0x{:08X}", record.hresult as u32));
+        parts.push(format!("ErrorId={}", safe_code_token(&record.error_id)));
+        parts.push(format!("Category={}", safe_code_token(&record.category)));
+    }
+    parts.join(", ")
+}
+
+#[cfg(windows)]
+fn safe_code_token(value: &str) -> String {
+    if value
+        .chars()
+        .any(|character| matches!(character, '\\' | '/' | ':' | '@'))
+    {
+        return "redacted".to_owned();
+    }
+    let token: String = value
+        .chars()
+        .take(120)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ',') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if token.is_empty() {
+        "unknown".to_owned()
+    } else {
+        token
+    }
+}
+
+#[cfg(windows)]
+fn package_installation(record: PackageRecord) -> Result<CodexInstallation, DiscoveryError> {
+    let (package_full_name, app_user_model_id) =
+        validated_package_activation(&record).ok_or(DiscoveryError::PackageIdentityRejected)?;
+    let root = dunce::canonicalize(&record.install_location).map_err(|error| {
+        DiscoveryError::PackageLocationUnavailable {
+            code: windows_io_code(&error),
+        }
+    })?;
+    if !root.is_dir() {
+        return Err(DiscoveryError::PackageLocationUnavailable {
+            code: "registered location is not a directory".to_owned(),
+        });
+    }
+    let executable = match record.application_executable.as_deref() {
+        Some(relative) => package_application_executable(&root, relative),
+        None => find_gui_executable(&root),
+    }
+    .ok_or(DiscoveryError::PackageExecutableMissing)?;
+    let app_server = contained_file(&root, &root.join("resources").join("codex.exe"))
+        .or_else(|| contained_file(&root, &root.join("app").join("resources").join("codex.exe")));
+    let channel = if record.name.to_ascii_lowercase().contains("beta") {
+        "beta"
+    } else {
+        "stable"
+    };
+    Ok(CodexInstallation {
+        executable,
+        version: record.version,
+        channel: channel.to_owned(),
+        source: DiscoverySource::WindowsPackageManager,
+
+        runtime_cache_unvirtualized: record.runtime_cache_unvirtualized,
+        package_name: Some(record.name),
+        package_full_name: Some(package_full_name),
+        app_user_model_id: Some(app_user_model_id),
+        app_server,
+    })
+}
+
+#[cfg(windows)]
+fn validated_package_activation(record: &PackageRecord) -> Option<(String, String)> {
+    const OFFICIAL_PUBLISHER: &str = "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B";
+    const OFFICIAL_PUBLISHER_ID: &str = "2p2nqsd0c76g0";
+    const MAX_PACKAGE_FULL_NAME_LENGTH: usize = 127;
+
+    if !matches!(record.name.as_str(), "OpenAI.Codex" | "OpenAI.CodexBeta")
+        || record.publisher != OFFICIAL_PUBLISHER
+    {
+        return None;
+    }
+
+    let expected_family = format!("{}_{}", record.name, OFFICIAL_PUBLISHER_ID);
+    let expected_full_name_prefix = format!("{}_", record.name);
+    let expected_full_name_suffix = format!("_{OFFICIAL_PUBLISHER_ID}");
+    if record.package_family_name != expected_family
+        || record.package_full_name.is_empty()
+        || record.package_full_name.len() > MAX_PACKAGE_FULL_NAME_LENGTH
+        || record.package_full_name.chars().any(char::is_control)
+        || !record
+            .package_full_name
+            .starts_with(&expected_full_name_prefix)
+        || !record
+            .package_full_name
+            .ends_with(&expected_full_name_suffix)
+    {
+        return None;
+    }
+
+    Some((
+        record.package_full_name.clone(),
+        format!("{}!App", record.package_family_name),
+    ))
+}
+
+#[cfg(windows)]
+fn find_gui_executable(root: &Path) -> Option<PathBuf> {
+    let known = [
+        root.join("app").join("ChatGPT.exe"),
+        root.join("app").join("ChatGPT (Beta).exe"),
+        root.join("app").join("Codex.exe"),
+        root.join("ChatGPT.exe"),
+        root.join("ChatGPT (Beta).exe"),
+        root.join("Codex.exe"),
+    ];
+    for candidate in known {
+        if let Some(candidate) = contained_file(root, &candidate) {
+            return Some(candidate);
+        }
+    }
+
+    // Package layouts may rename the branded executable. Only inspect one
+    // bounded directory level, never follow links, and only accept known names.
+    let app = root.join("app");
+    let entries = std::fs::read_dir(app).ok()?;
+    for item in entries.take(128).flatten() {
+        let name = item.file_name().to_string_lossy().to_ascii_lowercase();
+        if (name.starts_with("chatgpt") || name.starts_with("codex")) && name.ends_with(".exe") {
+            if let Some(candidate) = contained_file(root, &item.path()) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn package_application_executable(root: &Path, relative: &str) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let relative = Path::new(relative);
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        || !relative
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return None;
+    }
+    contained_file(root, &root.join(relative))
+}
+
+fn contained_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let candidate = dunce::canonicalize(candidate).ok()?;
+    if candidate.is_file() && path_starts_with(&candidate, root) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn canonical_executable(path: &Path) -> Result<PathBuf, DiscoveryError> {
+    let canonical = dunce::canonicalize(path).map_err(|error| {
+        DiscoveryError::InvalidExecutable.context("canonical_executable", format!("cause={error}"))
+    })?;
+    if !canonical.is_file() {
+        return Err(DiscoveryError::InvalidExecutable);
+    }
+    Ok(canonical)
+}
+
+fn discover_user_install(preference: ChannelPreference) -> Option<CodexInstallation> {
+    let local = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let mut candidates = Vec::new();
+    if let Some(local) = local {
+        candidates.extend([
+            (local.join("Programs/Codex/Codex.exe"), "stable"),
+            (local.join("Programs/ChatGPT/ChatGPT.exe"), "stable"),
+            (local.join("Programs/Codex Beta/Codex.exe"), "beta"),
+        ]);
+    }
+    candidates.sort_by_key(|(_, channel)| channel_rank(channel, preference));
+    for (candidate, channel) in candidates {
+        if channel_matches(channel, preference) && candidate.is_file() {
+            if let Ok(executable) = canonical_executable(&candidate) {
+                return Some(CodexInstallation {
+                    executable,
+                    version: "unknown".to_owned(),
+                    channel: channel.to_owned(),
+                    source: DiscoverySource::UserInstall,
+
+                    runtime_cache_unvirtualized: false,
+                    package_name: None,
+                    package_full_name: None,
+                    app_user_model_id: None,
+                    app_server: None,
+                });
+            }
+        }
+    }
+
+    // A PATH hit has no trustworthy channel metadata. An explicit Stable or
+    // Beta request must never silently attach debugging flags to an unrelated
+    // binary named Codex.exe.
+    if preference != ChannelPreference::Any {
+        return None;
+    }
+    find_on_path(&["Codex.exe", "ChatGPT.exe"]).map(|executable| CodexInstallation {
+        executable,
+        version: "unknown".to_owned(),
+        channel: "custom".to_owned(),
+        source: DiscoverySource::Path,
+
+        runtime_cache_unvirtualized: false,
+        package_name: None,
+        package_full_name: None,
+        app_user_model_id: None,
+        app_server: None,
+    })
+}
+
+pub fn discover_app_server_source(
+    explicit: Option<&Path>,
+    installation: Option<&CodexInstallation>,
+) -> Result<AppServerSource, DiscoveryError> {
+    if let Some(explicit) = explicit {
+        let executable = canonical_executable(explicit).map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("discover_app_server_source", format!("cause={error}"))
+        })?;
+        return Ok(AppServerSource {
+            executable,
+            kind: AppServerSourceKind::ExplicitDevelopmentOverride,
+        });
+    }
+
+    let Some(installation) = installation
+        .filter(|installation| installation.source == DiscoverySource::WindowsPackageManager)
+    else {
+        // User installs and PATH binaries have no package/publisher anchor. A
+        // caller can still authorize a development binary with --app-server.
+        return Err(DiscoveryError::AppServerNotFound);
+    };
+    let executable = installation
+        .app_server
+        .as_deref()
+        .ok_or(DiscoveryError::AppServerNotFound)
+        .and_then(|path| {
+            canonical_executable(path).map_err(|error| {
+                DiscoveryError::AppServerNotFound
+                    .context("discover_app_server_source", format!("cause={error}"))
+            })
+        })?;
+
+    #[cfg(windows)]
+    if !is_windows_apps_anchor(&executable) {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    #[cfg(not(windows))]
+    return Err(DiscoveryError::AppServerNotFound);
+
+    #[cfg(windows)]
+    Ok(AppServerSource {
+        executable,
+        kind: AppServerSourceKind::PackagedOfficial,
+    })
+}
+
+pub fn prepare_app_server_launch(
+    source: AppServerSource,
+) -> Result<AppServerLaunch, DiscoveryError> {
+    match source.kind {
+        AppServerSourceKind::ExplicitDevelopmentOverride => Ok(AppServerLaunch {
+            executable: source.executable,
+            #[cfg(windows)]
+            _stage: None,
+        }),
+        AppServerSourceKind::PackagedOfficial => {
+            #[cfg(windows)]
+            {
+                stage_packaged_app_server(&source.executable)
+            }
+            #[cfg(not(windows))]
+            {
+                Err(DiscoveryError::AppServerNotFound)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_apps_anchor(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("WindowsApps")
+    }) && path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("codex.exe"))
+}
+
+#[cfg(windows)]
+fn trusted_windows_path() -> Result<std::ffi::OsString, DiscoveryError> {
+    use known_folders::{KnownFolder, get_known_folder_path};
+
+    let windows = get_known_folder_path(KnownFolder::Windows)
+        .and_then(|path| dunce::canonicalize(path).ok())
+        .filter(|path| path.is_dir())
+        .ok_or(DiscoveryError::AppServerNotFound)?;
+    let system = get_known_folder_path(KnownFolder::System)
+        .and_then(|path| dunce::canonicalize(path).ok())
+        .filter(|path| path.is_dir() && path_starts_with(path, &windows))
+        .ok_or(DiscoveryError::AppServerNotFound)?;
+    let mut directories = vec![system];
+    if let Some(system_x86) = get_known_folder_path(KnownFolder::SystemX86)
+        .and_then(|path| dunce::canonicalize(path).ok())
+        .filter(|path| path.is_dir() && path_starts_with(path, &windows))
+    {
+        if !directories.contains(&system_x86) {
+            directories.push(system_x86);
+        }
+    }
+    directories.push(windows);
+    env::join_paths(directories).map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("trusted_windows_path", format!("cause={error}"))
+    })
+}
+
+#[cfg(windows)]
+const STAGE_ROOT_NAME: &str = "code-codex-app-server";
+#[cfg(windows)]
+const STAGE_DIRECTORY_PREFIX: &str = "stage-";
+#[cfg(windows)]
+const MAX_STALE_STAGE_SCAN: usize = 32;
+
+#[cfg(windows)]
+fn open_stage_root() -> Result<(PathBuf, File, Vec<File>), DiscoveryError> {
+    let staging_parent = std::env::temp_dir();
+    let temp = dunce::canonicalize(staging_parent).map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("open_stage_root", format!("cause={error}"))
+    })?;
+    let requested = temp.join(STAGE_ROOT_NAME);
+    std::fs::create_dir_all(&requested).map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("open_stage_root", format!("cause={error}"))
+    })?;
+    let root = dunce::canonicalize(&requested).map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("open_stage_root", format!("cause={error}"))
+    })?;
+    if !root.is_dir()
+        || !path_starts_with(&root, &temp)
+        || root.file_name().and_then(|name| name.to_str()) != Some(STAGE_ROOT_NAME)
+        || is_reparse_point(&root)?
+    {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+
+    // Retain a no-follow, no-delete-share handle for every canonical path
+    // component. Locking only the fresh leaf would still allow an ancestor
+    // rename to redirect the absolute CreateProcess path.
+    let ancestry_handles = open_locked_directory_ancestry(&root)?;
+    let retained_root = ancestry_handles
+        .last()
+        .ok_or(DiscoveryError::AppServerNotFound)?;
+    let verified_root = open_locked_directory_nofollow(&root, false)?;
+    if !same_file_identity(retained_root, &verified_root)? {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+
+    // An unshared lock serializes bounded stale reclamation with creation
+    // across launcher processes. It is held until the new stage is fully
+    // locked and verified, then released so another active stage may coexist.
+    let lock = acquire_stage_lock(&root)?;
+    reclaim_stale_stages(&root);
+    Ok((root, lock, ancestry_handles))
+}
+
+#[cfg(windows)]
+fn acquire_stage_lock(root: &Path) -> Result<File, DiscoveryError> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match try_open_stage_lock(root) {
+            Ok(lock) => return Ok(lock),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(32 | 33)) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return Err(DiscoveryError::AppServerNotFound),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn try_open_stage_lock(root: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(root.join("stage.lock"))
+}
+
+#[cfg(windows)]
+fn reclaim_stale_stages(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.take(MAX_STALE_STAGE_SCAN).flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !valid_stage_directory_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        if !validated_stale_stage(&path) {
+            continue;
+        }
+        // Active stages reject removal through their retained file/directory
+        // sharing handles. A crash releases those handles, and the recoverable
+        // DACL deliberately retains DELETE/DELETE_CHILD for this bounded pass.
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[cfg(windows)]
+fn valid_stage_directory_name(name: &str) -> bool {
+    name.len() > STAGE_DIRECTORY_PREFIX.len()
+        && name.len() <= 96
+        && name.starts_with(STAGE_DIRECTORY_PREFIX)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[cfg(windows)]
+fn validated_stale_stage(path: &Path) -> bool {
+    if !path.is_dir() || is_reparse_point(path).unwrap_or(true) {
+        return false;
+    }
+    let Ok(mut entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let Some(entry) = entries.next() else {
+        return true;
+    };
+    let Ok(entry) = entry else {
+        return false;
+    };
+    if entries.next().is_some()
+        || !entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("codex.exe")
+    {
+        return false;
+    }
+    let Ok(file_type) = entry.file_type() else {
+        return false;
+    };
+    file_type.is_file()
+        && !file_type.is_symlink()
+        && !is_reparse_point(&entry.path()).unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> Result<bool, DiscoveryError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("is_reparse_point", format!("cause={error}"))
+    })?;
+    Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(windows)]
+fn open_locked_directory_ancestry(path: &Path) -> Result<Vec<File>, DiscoveryError> {
+    if !path.is_absolute() {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    let mut ancestors: Vec<_> = path
+        .ancestors()
+        .filter(|ancestor| ancestor.is_absolute())
+        .collect();
+    ancestors.reverse();
+    if ancestors.last().copied() != Some(path) {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    ancestors
+        .into_iter()
+        .map(|ancestor| open_locked_directory_nofollow(ancestor, false))
+        .collect()
+}
+
+#[cfg(windows)]
+fn open_locked_directory_nofollow(path: &Path, write_dac: bool) -> Result<File, DiscoveryError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    if write_dac {
+        options.access_mode(FILE_GENERIC_READ | WRITE_DAC);
+    }
+    let opened = options
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("open_locked_directory_nofollow", format!("cause={error}"))
+        })?;
+    let metadata = opened.metadata().map_err(|error| {
+        DiscoveryError::AppServerNotFound
+            .context("open_locked_directory_nofollow", format!("cause={error}"))
+    })?;
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    Ok(opened)
+}
+
+#[cfg(windows)]
+fn bind_locked_stage_directory(path: &Path, write_dac: bool) -> Result<File, DiscoveryError> {
+    bind_locked_stage_directory_with(path, write_dac, || {})
+}
+
+#[cfg(windows)]
+fn bind_locked_stage_directory_with(
+    path: &Path,
+    write_dac: bool,
+    after_binding: impl FnOnce(),
+) -> Result<File, DiscoveryError> {
+    let retained = open_locked_directory_nofollow(path, write_dac)?;
+    after_binding();
+    let verified = open_locked_directory_nofollow(path, false)?;
+    if !same_file_identity(&retained, &verified)? {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    Ok(retained)
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &File, right: &File) -> Result<bool, DiscoveryError> {
+    let left = SameFileHandle::from_file(left.try_clone().map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("same_file_identity", format!("cause={error}"))
+    })?)
+    .map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("same_file_identity", format!("cause={error}"))
+    })?;
+    let right = SameFileHandle::from_file(right.try_clone().map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("same_file_identity", format!("cause={error}"))
+    })?)
+    .map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("same_file_identity", format!("cause={error}"))
+    })?;
+    Ok(left == right)
+}
+
+#[cfg(windows)]
+fn stage_packaged_app_server(official: &Path) -> Result<AppServerLaunch, DiscoveryError> {
+    let official = canonical_executable(official).map_err(|error| {
+        DiscoveryError::AppServerNotFound
+            .context("stage_packaged_app_server", format!("cause={error}"))
+    })?;
+    let mut official_handle = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&official)
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("stage_packaged_app_server", format!("cause={error}"))
+        })?;
+
+    let (stage_root, _stage_root_lock, ancestry_handles) = open_stage_root()?;
+    let directory = TempDirBuilder::new()
+        .prefix(STAGE_DIRECTORY_PREFIX)
+        .tempdir_in(stage_root)
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("stage_packaged_app_server", format!("cause={error}"))
+        })?;
+    let executable = directory.path().join("codex.exe");
+
+    // Lock the still-empty parent before creating anything by path. A parent
+    // swap before this point cannot detach a verified child because no child
+    // exists yet; after this handle opens, delete sharing is denied.
+    let mut directory_handle = bind_locked_stage_directory(directory.path(), true)?;
+
+    // Create the sole child with a non-replaceable writable handle. Applying
+    // the directory DACL immediately afterward closes child creation, and the
+    // bounded enumeration fails closed if anything won the short interval.
+    let mut executable_handle = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&executable)
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("stage_packaged_app_server", format!("cause={error}"))
+        })?;
+
+    let mut executable_acl_handle = OpenOptions::new()
+        .read(true)
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&executable)
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("stage_packaged_app_server", format!("cause={error}"))
+        })?;
+    deny_staged_executable_mutation(&mut executable_acl_handle)?;
+    deny_stage_child_creation(&mut directory_handle)?;
+    ensure_stage_contains_only_executable(directory.path(), &executable)?;
+
+    let mut stage = StagedAppServer {
+        executable_handle: None,
+        executable_acl_handle: Some(executable_acl_handle),
+        directory_handle: Some(directory_handle),
+        ancestry_handles,
+        directory: Some(directory),
+        trusted_path: trusted_windows_path()?,
+    };
+
+    let mut official_hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = official_handle.read(&mut buffer).map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("stage_packaged_app_server", format!("cause={error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        official_hasher.update(&buffer[..read]);
+        executable_handle
+            .write_all(&buffer[..read])
+            .map_err(|error| {
+                DiscoveryError::AppServerNotFound
+                    .context("stage_packaged_app_server", format!("cause={error}"))
+            })?;
+    }
+    executable_handle.sync_all().map_err(|error| {
+        DiscoveryError::AppServerNotFound
+            .context("stage_packaged_app_server", format!("cause={error}"))
+    })?;
+    let official_digest: [u8; 32] = official_hasher.finalize().into();
+
+    // The locked file DACL protects the deliberate handle transition. The
+    // final retained handle is read-only with read-only sharing, which is
+    // compatible with CreateProcess and denies later write/delete opens.
+    drop(executable_handle);
+    let mut spawn_path_handle = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&executable)
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("stage_packaged_app_server", format!("cause={error}"))
+        })?;
+    let spawn_metadata = spawn_path_handle.metadata().map_err(|error| {
+        DiscoveryError::AppServerNotFound
+            .context("stage_packaged_app_server", format!("cause={error}"))
+    })?;
+    if spawn_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || spawn_metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
+    {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+
+    // The read-only/share-read handle now supplies live immutability. Restore
+    // a normally deletable file DACL immediately so a launcher crash cannot
+    // strand a large executable; the parent handle/DACL still blocks adjacent
+    // files and the retained file handle still blocks write/delete opens.
+    if let Some(handle) = stage.executable_acl_handle.as_mut() {
+        set_protected_dacl(handle, "D:P(A;;FA;;;AU)(A;;FA;;;SY)(A;;FA;;;BA)")?;
+    }
+    stage.executable_acl_handle.take();
+
+    // Reopen through the exact path passed to CreateProcess, then verify using
+    // that retained handle. A pre-lock parent substitution therefore cannot
+    // redirect spawn to bytes other than the official open anchor.
+    spawn_path_handle
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound
+                .context("stage_packaged_app_server", format!("cause={error}"))
+        })?;
+    let staged_digest = sha256_reader(&mut spawn_path_handle)?;
+    if staged_digest != official_digest {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    stage.executable_handle = Some(spawn_path_handle);
+
+    // The locked directory intentionally has no adjacent DLLs and cannot gain
+    // an `<exe>.local` redirect while the process lives. The launch command
+    // also uses this directory as CWD and limits PATH to Known Folder API
+    // Windows/system directories, so OS imports resolve through
+    // KnownDLLs/system locations rather than user-writable search locations.
+    Ok(AppServerLaunch {
+        executable,
+        _stage: Some(stage),
+    })
+}
+
+#[cfg(windows)]
+fn deny_stage_child_creation(directory_handle: &mut File) -> Result<(), DiscoveryError> {
+    // Deny add-file/add-directory plus DACL/owner mutation to Everyone and to
+    // Owner Rights. The latter removes the owner's otherwise implicit
+    // WRITE_DAC bypass. Authenticated users retain the remaining rights, while
+    // the retained no-delete-share handle blocks parent deletion and rename.
+    set_protected_dacl(
+        directory_handle,
+        "D:P(D;;0x000C0006;;;WD)(D;;0x000C0006;;;OW)(A;;FA;;;AU)(A;;FA;;;SY)(A;;FA;;;BA)",
+    )
+}
+
+#[cfg(windows)]
+fn deny_staged_executable_mutation(executable_acl_handle: &mut File) -> Result<(), DiscoveryError> {
+    // Deny data/attribute writes, delete, WRITE_DAC, and WRITE_OWNER before
+    // closing the writable copy handle. OWNER RIGHTS prevents an owner-token
+    // DACL rewrite during the transition to the read-only spawn handle.
+    set_protected_dacl(
+        executable_acl_handle,
+        "D:P(D;;0x000D0116;;;WD)(D;;0x000D0116;;;OW)(A;;FRFX;;;AU)(A;;FRFX;;;SY)(A;;FRFX;;;BA)",
+    )
+}
+
+#[cfg(windows)]
+fn set_protected_dacl(handle: &mut File, sddl: &str) -> Result<(), DiscoveryError> {
+    let descriptor: LocalBox<SecurityDescriptor> = sddl.parse().map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("set_protected_dacl", format!("cause={error}"))
+    })?;
+    let dacl = descriptor.dacl().ok_or(DiscoveryError::AppServerNotFound)?;
+    windows_permissions::wrappers::SetSecurityInfo(
+        handle,
+        SeObjectType::SE_FILE_OBJECT,
+        SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
+        None,
+        None,
+        Some(dacl),
+        None,
+    )
+    .map_err(|error| {
+        DiscoveryError::AppServerNotFound.context("set_protected_dacl", format!("cause={error}"))
+    })
+}
+
+#[cfg(windows)]
+fn ensure_stage_contains_only_executable(
+    directory: &Path,
+    executable: &Path,
+) -> Result<(), DiscoveryError> {
+    let mut entries = std::fs::read_dir(directory).map_err(|error| {
+        DiscoveryError::AppServerNotFound.context(
+            "ensure_stage_contains_only_executable",
+            format!("cause={error}"),
+        )
+    })?;
+    let entry = entries
+        .next()
+        .transpose()
+        .map_err(|error| {
+            DiscoveryError::AppServerNotFound.context(
+                "ensure_stage_contains_only_executable",
+                format!("cause={error}"),
+            )
+        })?
+        .ok_or(DiscoveryError::AppServerNotFound)?;
+    if entry.path() != executable || entries.next().is_some() {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    let file_type = entry.file_type().map_err(|error| {
+        DiscoveryError::AppServerNotFound.context(
+            "ensure_stage_contains_only_executable",
+            format!("cause={error}"),
+        )
+    })?;
+    if !file_type.is_file() || file_type.is_symlink() {
+        return Err(DiscoveryError::AppServerNotFound);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sha256_reader(reader: &mut File) -> Result<[u8; 32], DiscoveryError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| {
+            DiscoveryError::AppServerNotFound.context("sha256_reader", format!("cause={error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn find_on_path(names: &[&str]) -> Option<PathBuf> {
+    let mut visited = HashSet::new();
+    for directory in env::split_paths(&env::var_os("PATH")?) {
+        let Ok(directory) = dunce::canonicalize(directory) else {
+            continue;
+        };
+        if !visited.insert(directory.clone()) {
+            continue;
+        }
+        for name in names {
+            let candidate = directory.join(name);
+            if let Ok(executable) = canonical_executable(&candidate) {
+                return Some(executable);
+            }
+        }
+    }
+    None
+}
+
+fn channel_matches(channel: &str, preference: ChannelPreference) -> bool {
+    match preference {
+        ChannelPreference::Any => true,
+        ChannelPreference::Stable => channel == "stable",
+        ChannelPreference::Beta => channel == "beta",
+    }
+}
+
+fn channel_rank(channel: &str, preference: ChannelPreference) -> u8 {
+    match (preference, channel) {
+        (ChannelPreference::Stable, "stable") | (ChannelPreference::Beta, "beta") => 0,
+        (ChannelPreference::Any, "stable") => 0,
+        (ChannelPreference::Any, "beta") => 1,
+        _ => 2,
+    }
+}
+
+fn version_key(version: &str) -> [u32; 4] {
+    let mut key = [0; 4];
+    for (slot, component) in key.iter_mut().zip(version.split('.')) {
+        *slot = component.parse().unwrap_or(0);
+    }
+    key
+}
+
+fn path_starts_with(candidate: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let candidate: Vec<_> = candidate
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        let root: Vec<_> = root
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        candidate.starts_with(&root)
+    }
+    #[cfg(not(windows))]
+    {
+        candidate.starts_with(root)
+    }
+}
+
+#[must_use]
+pub fn is_supported_version(_version: &str) -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_allows_all_versions() {
+        assert!(is_supported_version("26.715.10079.0"));
+        assert!(is_supported_version("26.715.3651.0"));
+        assert!(is_supported_version("26.721.4979.0"));
+        assert!(is_supported_version("26.730.8199.0"));
+        assert!(is_supported_version("999.999.9999.0"));
+        assert!(is_supported_version("unknown"));
+    }
+
+    #[test]
+    fn verified_stable_is_preferred_when_channel_is_any() {
+        assert!(
+            channel_rank("stable", ChannelPreference::Any)
+                < channel_rank("beta", ChannelPreference::Any)
+        );
+        assert!(channel_matches("stable", ChannelPreference::Stable));
+        assert!(!channel_matches("beta", ChannelPreference::Stable));
+        assert!(channel_matches("beta", ChannelPreference::Beta));
+        assert!(!channel_matches("stable", ChannelPreference::Beta));
+        assert!(version_key("26.715.10000.0") > version_key("26.715.9999.0"));
+    }
+
+    #[test]
+    fn explicit_channels_do_not_match_unknown_path_channels() {
+        assert!(!channel_matches("custom", ChannelPreference::Stable));
+        assert!(!channel_matches("custom", ChannelPreference::Beta));
+        assert!(channel_matches("custom", ChannelPreference::Any));
+    }
+
+    #[cfg(windows)]
+    fn test_package_record(name: &str, root: &Path) -> PackageRecord {
+        PackageRecord {
+            name: name.to_owned(),
+            version: "26.917.6896.0".to_owned(),
+            install_location: root.to_string_lossy().into_owned(),
+            publisher: "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B".to_owned(),
+            package_family_name: format!("{name}_2p2nqsd0c76g0"),
+            package_full_name: format!("{name}_26.917.6896.0_x64__2p2nqsd0c76g0"),
+            application_executable: None,
+            runtime_cache_unvirtualized: true,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_application_manifest_selects_its_app_executable() {
+        let root = tempfile::tempdir().expect("package root");
+        let app = root.path().join("app");
+        std::fs::create_dir(&app).expect("app directory");
+        std::fs::write(app.join("ChatGPT.exe"), b"chatgpt").expect("first candidate");
+        std::fs::write(app.join("Codex.exe"), b"codex").expect("manifest candidate");
+        let mut record = test_package_record("OpenAI.Codex", root.path());
+        record.application_executable = Some("app/Codex.exe".to_owned());
+        let installation = package_installation(record).expect("official package");
+        assert_eq!(
+            installation.executable,
+            dunce::canonicalize(app.join("Codex.exe")).unwrap()
+        );
+        assert!(package_application_executable(root.path(), "../other.exe").is_none());
+        assert!(package_application_executable(root.path(), r"C:\other.exe").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_query_failure_preserves_codes_without_paths_or_messages() {
+        let stderr = br#"{"errorId":"GetAppxPackageCommandException,Microsoft.Windows.Appx.PackageManager.Commands.GetAppxPackageCommand","category":"PermissionDenied","hresult":-2147024891}"#;
+        let code = package_query_exit_code(Some(1), stderr);
+        assert!(code.contains("PowerShell exit=1"));
+        assert!(code.contains("HRESULT=0x80070005"));
+        assert!(code.contains("Category=PermissionDenied"));
+        assert!(!code.contains("C:\\Users"));
+
+        let unsafe_stderr = br#"{"errorId":"C:\\Users\\alice\\secret.txt","category":"PermissionDenied","hresult":-2147024891}"#;
+        let code = package_query_exit_code(Some(1), unsafe_stderr);
+        assert!(!code.contains("C:\\Users"));
+        assert!(!code.contains("\\"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovery_explains_missing_stable_and_beta_only_installations() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        assert!(matches!(
+            select_package_installations(Vec::new(), ChannelPreference::Stable),
+            Err(DiscoveryError::StablePackageNotRegistered)
+        ));
+        let beta = test_package_record("OpenAI.CodexBeta", directory.path());
+        assert!(matches!(
+            select_package_installations(vec![beta], ChannelPreference::Stable),
+            Err(DiscoveryError::StablePackageNotRegisteredBetaOnly)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovery_explains_untrusted_inaccessible_and_incomplete_packages() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let mut untrusted = test_package_record("OpenAI.Codex", directory.path());
+        untrusted.publisher = "CN=NotOpenAI".to_owned();
+        assert!(matches!(
+            select_package_installations(vec![untrusted], ChannelPreference::Stable),
+            Err(DiscoveryError::PackageIdentityRejected)
+        ));
+
+        let missing = test_package_record("OpenAI.Codex", &directory.path().join("missing"));
+        assert!(matches!(
+            select_package_installations(vec![missing], ChannelPreference::Stable),
+            Err(DiscoveryError::PackageLocationUnavailable { .. })
+        ));
+
+        let incomplete = test_package_record("OpenAI.Codex", directory.path());
+        assert!(matches!(
+            select_package_installations(vec![incomplete], ChannelPreference::Stable),
+            Err(DiscoveryError::PackageExecutableMissing)
+        ));
+
+        let app = directory.path().join("app");
+        std::fs::create_dir(&app).expect("app dir");
+        std::fs::write(app.join("ChatGPT.exe"), b"test executable").expect("app executable");
+        let valid = test_package_record("OpenAI.Codex", directory.path());
+        let found = select_package_installations(vec![valid], ChannelPreference::Stable)
+            .expect("registered stable package");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].source, DiscoverySource::WindowsPackageManager);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn official_package_activation_metadata_is_derived_from_validated_identity() {
+        let record = PackageRecord {
+            name: "OpenAI.Codex".to_owned(),
+            version: "26.721.11231.0".to_owned(),
+            install_location: r"C:\Program Files\WindowsApps\OpenAI.Codex".to_owned(),
+            publisher: "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B".to_owned(),
+            package_family_name: "OpenAI.Codex_2p2nqsd0c76g0".to_owned(),
+            package_full_name: "OpenAI.Codex_26.721.11231.0_x64__2p2nqsd0c76g0".to_owned(),
+            application_executable: None,
+            runtime_cache_unvirtualized: true,
+        };
+
+        assert_eq!(
+            validated_package_activation(&record),
+            Some((
+                "OpenAI.Codex_26.721.11231.0_x64__2p2nqsd0c76g0".to_owned(),
+                "OpenAI.Codex_2p2nqsd0c76g0!App".to_owned(),
+            ))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn package_activation_metadata_rejects_untrusted_or_malformed_identity_fields() {
+        let mut record = PackageRecord {
+            name: "OpenAI.CodexBeta".to_owned(),
+            version: "26.721.11231.0".to_owned(),
+            install_location: r"C:\Program Files\WindowsApps\OpenAI.CodexBeta".to_owned(),
+            publisher: "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B".to_owned(),
+            package_family_name: "OpenAI.CodexBeta_2p2nqsd0c76g0".to_owned(),
+            package_full_name: "OpenAI.CodexBeta_26.721.11231.0_x64__2p2nqsd0c76g0".to_owned(),
+            application_executable: None,
+            runtime_cache_unvirtualized: true,
+        };
+
+        record.package_family_name = "Attacker_2p2nqsd0c76g0".to_owned();
+        assert!(validated_package_activation(&record).is_none());
+
+        record.package_family_name = "OpenAI.CodexBeta_2p2nqsd0c76g0".to_owned();
+        record.package_full_name =
+            "OpenAI.CodexBeta_26.721.11231.0_x64__2p2nqsd0c76g0\n".to_owned();
+        assert!(validated_package_activation(&record).is_none());
+
+        record.package_full_name = format!("OpenAI.CodexBeta_{}_2p2nqsd0c76g0", "x".repeat(128));
+        assert!(validated_package_activation(&record).is_none());
+
+        record.package_full_name = "Other.Package_26.721.11231.0_x64__2p2nqsd0c76g0".to_owned();
+        assert!(validated_package_activation(&record).is_none());
+    }
+
+    #[test]
+    fn explicit_app_server_override_remains_available_for_development() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let explicit = directory.path().join("development-app-server.exe");
+        std::fs::write(&explicit, b"development override").expect("explicit executable");
+
+        let source =
+            discover_app_server_source(Some(&explicit), None).expect("explicit override source");
+        assert_eq!(
+            source.kind(),
+            AppServerSourceKind::ExplicitDevelopmentOverride
+        );
+        assert_eq!(
+            source.executable,
+            dunce::canonicalize(&explicit).expect("canonical explicit executable")
+        );
+
+        let resolved = prepare_app_server_launch(source).expect("explicit launch");
+        assert_eq!(
+            resolved.executable(),
+            dunce::canonicalize(&explicit)
+                .expect("canonical explicit executable")
+                .as_path()
+        );
+    }
+
+    #[test]
+    fn unanchored_app_server_is_not_implicitly_trusted() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let executable = directory.path().join("codex.exe");
+        std::fs::write(&executable, b"unanchored").expect("test executable");
+        let installation = CodexInstallation {
+            executable: executable.clone(),
+            version: "test".to_owned(),
+            channel: "custom".to_owned(),
+            source: DiscoverySource::UserInstall,
+
+            runtime_cache_unvirtualized: false,
+            package_name: None,
+            package_full_name: None,
+            app_user_model_id: None,
+            app_server: Some(executable),
+        };
+
+        assert!(discover_app_server_source(None, Some(&installation)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packaged_source_discovery_does_not_materialize_a_copy() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let official_directory = directory.path().join("WindowsApps").join("official");
+        std::fs::create_dir_all(&official_directory).expect("official directory");
+        let official = official_directory.join("codex.exe");
+        std::fs::write(&official, b"official app server").expect("official executable");
+        let installation = CodexInstallation {
+            executable: official.clone(),
+            version: "test".to_owned(),
+            channel: "beta".to_owned(),
+            source: DiscoverySource::WindowsPackageManager,
+            runtime_cache_unvirtualized: false,
+            package_name: Some("OpenAI.CodexBeta".to_owned()),
+            package_full_name: Some("OpenAI.CodexBeta_26.715.3651.0_x64__2p2nqsd0c76g0".to_owned()),
+            app_user_model_id: Some("OpenAI.CodexBeta_2p2nqsd0c76g0!App".to_owned()),
+            app_server: Some(official.clone()),
+        };
+
+        let source = discover_app_server_source(None, Some(&installation)).expect("source");
+        assert_eq!(source.kind(), AppServerSourceKind::PackagedOfficial);
+        assert_eq!(
+            source.executable,
+            dunce::canonicalize(&official).expect("canonical official")
+        );
+        assert_eq!(
+            std::fs::read_dir(&official_directory)
+                .expect("read official directory")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_bytes_are_identical_and_paths_are_unique_then_cleaned() {
+        let source_directory = tempfile::TempDir::new().expect("source temp dir");
+        let official = source_directory.path().join("codex.exe");
+        let bytes: Vec<u8> = (0_u32..200_000)
+            .map(|index| ((index.wrapping_mul(31) + 17) % 251) as u8)
+            .collect();
+        std::fs::write(&official, &bytes).expect("official executable");
+
+        let first = stage_packaged_app_server(&official).expect("first stage");
+        let second = stage_packaged_app_server(&official).expect("second stage");
+        assert_eq!(
+            std::fs::read(first.executable()).expect("staged bytes"),
+            bytes
+        );
+        assert_ne!(first.executable(), second.executable());
+        assert_ne!(first.executable().parent(), second.executable().parent());
+
+        let first_directory = first
+            .executable()
+            .parent()
+            .expect("stage parent")
+            .to_path_buf();
+        let second_directory = second
+            .executable()
+            .parent()
+            .expect("stage parent")
+            .to_path_buf();
+        drop(first);
+        drop(second);
+        assert!(!first_directory.exists());
+        assert!(!second_directory.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_guard_denies_write_rename_replace_and_adjacent_files() {
+        let source_directory = tempfile::TempDir::new().expect("source temp dir");
+        let official = source_directory.path().join("codex.exe");
+        std::fs::write(&official, b"official app server").expect("official executable");
+        let launch = stage_packaged_app_server(&official).expect("stage");
+        let executable = launch.executable().to_path_buf();
+        let stage_directory = executable.parent().expect("stage parent").to_path_buf();
+        assert_eq!(
+            launch.hardened_working_directory(),
+            Some(stage_directory.as_path())
+        );
+        let trusted_path: Vec<_> = env::split_paths(
+            launch
+                .sanitized_path()
+                .expect("packaged launch path policy"),
+        )
+        .collect();
+        assert!(trusted_path.len() >= 2);
+        assert!(
+            trusted_path
+                .iter()
+                .all(|path| path.is_absolute() && path.is_dir())
+        );
+        assert!(!trusted_path.contains(&source_directory.path().to_path_buf()));
+
+        assert!(OpenOptions::new().write(true).open(&executable).is_err());
+        assert!(std::fs::rename(&executable, stage_directory.join("renamed.exe")).is_err());
+        assert!(std::fs::remove_file(&executable).is_err());
+        assert!(
+            std::fs::rename(&stage_directory, stage_directory.with_extension("renamed")).is_err()
+        );
+
+        assert!(
+            OpenOptions::new()
+                .read(true)
+                .access_mode(READ_CONTROL | WRITE_DAC)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&stage_directory)
+                .is_err()
+        );
+
+        let replacement = source_directory.path().join("replacement.exe");
+        std::fs::write(&replacement, b"replacement").expect("replacement");
+        assert!(std::fs::rename(&replacement, &executable).is_err());
+        assert!(std::fs::copy(&replacement, &executable).is_err());
+
+        assert!(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(stage_directory.join("version.dll"))
+                .is_err()
+        );
+        assert!(std::fs::create_dir(stage_directory.join("codex.exe.local")).is_err());
+        assert_eq!(
+            std::fs::read_dir(&stage_directory)
+                .expect("read locked stage")
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nofollow_stage_binding_rejects_a_junction() {
+        let root = tempfile::TempDir::new().expect("root");
+        let target = root.path().join("attacker-target");
+        let junction_path = root.path().join("stage-junction_1");
+        std::fs::create_dir(&target).expect("target");
+        std::fs::write(target.join("marker.txt"), b"attacker").expect("marker");
+        junction::create(&target, &junction_path).expect("create junction");
+
+        assert!(open_locked_directory_nofollow(&junction_path, true).is_err());
+        assert!(!target.join("codex.exe").exists());
+        assert_eq!(
+            std::fs::read(target.join("marker.txt")).expect("marker survives"),
+            b"attacker"
+        );
+
+        junction::delete(&junction_path).expect("delete junction");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_stage_binding_blocks_or_rejects_junction_substitution() {
+        use std::cell::Cell;
+
+        let root = tempfile::TempDir::new().expect("root");
+        let stage = root.path().join("stage-bound_1");
+        let displaced = root.path().join("displaced");
+        let target = root.path().join("attacker-target");
+        std::fs::create_dir(&stage).expect("stage");
+        std::fs::create_dir(&target).expect("target");
+        let swapped = Cell::new(false);
+
+        let result = bind_locked_stage_directory_with(&stage, true, || {
+            if std::fs::rename(&stage, &displaced).is_ok() {
+                junction::create(&target, &stage).expect("replacement junction");
+                swapped.set(true);
+            }
+        });
+
+        if swapped.get() {
+            assert!(result.is_err());
+            junction::delete(&stage).expect("delete replacement junction");
+            std::fs::remove_dir(&displaced).expect("remove displaced stage");
+        } else {
+            assert!(result.is_ok());
+            assert!(!displaced.exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_ancestry_blocks_parent_rename() {
+        let root = tempfile::TempDir::new().expect("root");
+        let first = root.path().join("first");
+        let leaf = first.join("second");
+        let moved = root.path().join("moved");
+        std::fs::create_dir_all(&leaf).expect("path ancestry");
+        let handles = open_locked_directory_ancestry(&leaf).expect("locked ancestry");
+
+        assert!(std::fs::rename(&first, &moved).is_err());
+        drop(handles);
+        std::fs::rename(&first, &moved).expect("rename after ancestry release");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_stage_is_user_deletable_after_all_handles_close() {
+        let source_directory = tempfile::TempDir::new().expect("source temp dir");
+        let official = source_directory.path().join("codex.exe");
+        std::fs::write(&official, b"official app server").expect("official executable");
+        let mut launch = stage_packaged_app_server(&official).expect("stage");
+        let mut stage = launch._stage.take().expect("staged guard");
+        stage.executable_handle.take();
+        stage.executable_acl_handle.take();
+        stage.directory_handle.take();
+        let stale = stage.directory.take().expect("stage directory").keep();
+        drop(stage);
+        drop(launch);
+
+        std::fs::remove_dir_all(&stale).expect("stale stage remains deletable");
+        assert!(!stale.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transition_dacl_is_deletable_after_crash_style_handle_loss() {
+        let root = tempfile::TempDir::new().expect("root");
+        let stage_directory = root.path().join("stage-transition_1");
+        std::fs::create_dir(&stage_directory).expect("stage directory");
+        let executable = stage_directory.join("codex.exe");
+        let executable_handle = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&executable)
+            .expect("create executable");
+        let mut executable_acl_handle = OpenOptions::new()
+            .read(true)
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&executable)
+            .expect("executable ACL handle");
+        let mut directory_handle = OpenOptions::new()
+            .access_mode(FILE_GENERIC_READ | WRITE_DAC)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&stage_directory)
+            .expect("directory handle");
+        deny_staged_executable_mutation(&mut executable_acl_handle).expect("file DACL");
+        deny_stage_child_creation(&mut directory_handle).expect("directory DACL");
+
+        // Simulate process-handle loss without running Drop's ACL restoration.
+        drop(executable_handle);
+        drop(executable_acl_handle);
+        drop(directory_handle);
+        std::fs::remove_dir_all(&stage_directory)
+            .expect("parent DELETE_CHILD keeps crash cleanup recoverable");
+        assert!(!stage_directory.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_reclamation_is_bounded_to_validated_stage_payloads() {
+        let root = tempfile::TempDir::new().expect("root");
+        let empty = root.path().join("stage-empty_1");
+        let executable_only = root.path().join("stage-executable_1");
+        let unexpected = root.path().join("stage-unexpected_1");
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir(&empty).expect("empty");
+        std::fs::create_dir(&executable_only).expect("executable stage");
+        std::fs::write(executable_only.join("codex.exe"), b"stale").expect("stale executable");
+        std::fs::create_dir(&unexpected).expect("unexpected stage");
+        std::fs::write(unexpected.join("other.txt"), b"do not delete").expect("unexpected file");
+        std::fs::create_dir(&unrelated).expect("unrelated");
+
+        reclaim_stale_stages(root.path());
+
+        assert!(!empty.exists());
+        assert!(!executable_only.exists());
+        assert!(unexpected.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stage_lock_serializes_creators() {
+        let root = tempfile::TempDir::new().expect("root");
+        let first = try_open_stage_lock(root.path()).expect("first lock");
+        assert!(try_open_stage_lock(root.path()).is_err());
+        drop(first);
+        assert!(try_open_stage_lock(root.path()).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stale_reclamation_has_a_strict_scan_bound() {
+        let root = tempfile::TempDir::new().expect("root");
+        for index in 0..(MAX_STALE_STAGE_SCAN + 5) {
+            std::fs::create_dir(root.path().join(format!("stage-bounded_{index}")))
+                .expect("stage directory");
+        }
+
+        reclaim_stale_stages(root.path());
+
+        let remaining = std::fs::read_dir(root.path())
+            .expect("remaining stages")
+            .count();
+        assert!(remaining >= 5);
+    }
+}

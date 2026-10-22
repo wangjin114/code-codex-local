@@ -1,0 +1,1813 @@
+//! First-party downloadable plugins. The trusted catalog is
+//! compiled into the core; downloads cannot choose URLs or expected hashes.
+use base64::Engine;
+use cdp_client::BridgeError;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
+
+const CATALOG: &str = include_str!("../../../packages/explorer-ui/dist/plugins/catalog.json");
+const MAX_SCRIPT: usize = 4 * 1024 * 1024;
+const MAX_PACKAGE: usize = 32 * 1024 * 1024;
+const MAX_RESOURCES: usize = 32;
+const RESOURCE_CHUNK: usize = 1024 * 1024;
+const CATEGORIES: [&str; 3] = ["appearance", "file-preview", "developer-tools"];
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Resource {
+    #[serde(default)]
+    pub release_tag: String,
+    pub asset: String,
+    pub size: usize,
+    pub sha256: String,
+    #[serde(default)]
+    pub relative_path: String,
+    #[serde(default = "script_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub image: Option<Value>,
+    #[serde(default)]
+    pub mime_type: String,
+}
+#[derive(Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Package {
+    pub id: String,
+    #[serde(default = "appearance_category")]
+    pub category: String,
+    pub name: String,
+    pub api: u32,
+    pub version: String,
+    pub release_tag: String,
+    #[serde(default)]
+    pub local_only: bool,
+    pub size: usize,
+    pub sha256: String,
+    pub asset: String,
+    #[serde(default)]
+    pub resources: Vec<Resource>,
+    #[serde(default)]
+    pub relative_path: String,
+    #[serde(default = "script_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub gallery_version: u32,
+    #[serde(default)]
+    pub default_image_count: usize,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+}
+fn appearance_category() -> String {
+    "appearance".into()
+}
+fn script_kind() -> String {
+    "script".into()
+}
+impl Package {
+    fn assets(&self) -> Vec<Self> {
+        let mut assets = self
+            .resources
+            .iter()
+            .map(|r| Self {
+                asset: r.asset.clone(),
+                size: r.size,
+                sha256: r.sha256.clone(),
+                resources: Vec::new(),
+                relative_path: r.relative_path.clone(),
+                kind: r.kind.clone(),
+                mime_type: r.mime_type.clone(),
+                release_tag: if r.release_tag.is_empty() {self.release_tag.clone()} else {r.release_tag.clone()},
+                ..self.clone()
+            })
+            .collect::<Vec<_>>();
+        assets.push(Self {
+            resources: Vec::new(),
+            ..self.clone()
+        });
+        assets
+    }
+    fn total_size(&self) -> usize {
+        self.resources
+            .iter()
+            .fold(self.size, |total, r| total.saturating_add(r.size))
+    }
+}
+struct Job {
+    cancel: CancellationToken,
+    phase: &'static str,
+    bytes: usize,
+    error: Option<String>,
+}
+fn jobs() -> &'static Mutex<HashMap<String, Job>> {
+    static JOBS: OnceLock<Mutex<HashMap<String, Job>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn error(code: &str, message: impl Into<String>) -> BridgeError {
+    BridgeError::new(code, message.into())
+}
+pub(crate) fn catalog() -> Result<Vec<Package>, BridgeError> {
+    parse_catalog(CATALOG)
+}
+fn parse_catalog(source: &str) -> Result<Vec<Package>, BridgeError> {
+    let packages: Vec<Package> = serde_json::from_str(source).map_err(|parse| {
+        error(
+            "PLUGIN_CATALOG",
+            format!(
+                "Embedded plugin catalog JSON failed: category={:?}; line={}; column={}",
+                parse.classify(),
+                parse.line(),
+                parse.column()
+            ),
+        )
+    })?;
+    if packages.is_empty() || packages.len() > 64 {
+        return Err(error(
+            "PLUGIN_CATALOG",
+            "The plugin catalog count is invalid.",
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut assets = std::collections::HashSet::new();
+    for p in &packages {
+        if !ids.insert(&p.id) || !valid_package(p) {
+            return Err(error(
+                "PLUGIN_CATALOG",
+                "Invalid or duplicate trusted plugin descriptor.",
+            ));
+        }
+        for asset in p.assets() {
+            // GitHub Release assets are flat, even though local packages are categorized.
+            if !assets.insert(asset.asset) {
+                return Err(error("PLUGIN_CATALOG", "Duplicate trusted release asset."));
+            }
+        }
+    }
+    for p in &packages {
+        dependency_order(&packages, &p.id)?;
+    }
+    Ok(packages)
+}
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit())
+}
+fn trusted_asset(p: &Package, name: &str) -> bool {
+    safe_component(name)
+        && (name.starts_with(&format!("CodeCodex-background-{}-", p.id))
+            || name.starts_with(&format!("CodeCodex-plugin-{}-", p.id)))
+}
+fn safe_relative(value: &str) -> bool {
+    !value.is_empty() && value.split('/').count() <= 4 && value.split('/').all(safe_component)
+}
+fn valid_release_tag(value: &str) -> bool {
+    let asset_release = value.strip_prefix("plugin-assets-").is_some_and(|date| {
+        date.len() == 10
+            && date.bytes().enumerate().all(|(i, c)| {
+                if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() }
+            })
+    });
+    safe_component(value) && (value.starts_with('v') || asset_release)
+}
+fn valid_package(p: &Package) -> bool {
+    let mut paths = std::collections::HashSet::new();
+    paths.insert(&p.relative_path);
+    p.api == 1
+        && CATEGORIES.contains(&p.category.as_str())
+        && safe_component(&p.id)
+        && safe_component(&p.version)
+        && valid_release_tag(&p.release_tag)
+        && p.size > 0
+        && p.size <= MAX_SCRIPT
+        && valid_hash(&p.sha256)
+        && p.kind == "script"
+        && trusted_asset(p, &p.asset)
+        && p.asset.ends_with(".js")
+        && p.relative_path == p.asset
+        && (!p.local_only
+            || (p.id == "codex-startup-transition"
+                && p.version == "1.1.26-local.1"
+                && p.resources.is_empty()))
+        && p.resources.len() <= MAX_RESOURCES
+        && p.total_size() <= MAX_PACKAGE
+        && p.resources.iter().all(|r| {
+            r.size > 0
+                && r.size <= MAX_SCRIPT
+                && valid_hash(&r.sha256)
+                && (r.release_tag.is_empty() || valid_release_tag(&r.release_tag))
+                && trusted_asset(p, &r.asset)
+                && safe_relative(&r.relative_path)
+                && r.relative_path.rsplit('/').next() == Some(r.asset.as_str())
+                && paths.insert(&r.relative_path)
+                && match r.kind.as_str() {
+                    "script" | "worker" => r.asset.ends_with(".js"),
+                    "style" => r.asset.ends_with(".css"),
+                    "wasm" => r.asset.ends_with(".wasm"),
+                    "binary" => {
+                        !r.mime_type.is_empty()
+                            && r.mime_type.len() <= 128
+                            && r.mime_type
+                                .bytes()
+                                .all(|c| c.is_ascii_graphic() && c != b'\'' && c != b'\"')
+                    }
+                    "image" | "thumbnail" => {
+                        r.asset.ends_with(".png")
+                            && r.relative_path == format!("media/{}", r.asset)
+                            && (r.kind != "image" || r.image.as_ref().is_some_and(Value::is_object))
+                    }
+                    _ => false,
+                }
+        })
+}
+fn dependency_order<'a>(
+    packages: &'a [Package],
+    id: &str,
+) -> Result<Vec<&'a Package>, BridgeError> {
+    fn visit<'a>(
+        packages: &'a [Package],
+        id: &str,
+        active: &mut Vec<String>,
+        done: &mut Vec<&'a Package>,
+    ) -> Result<(), BridgeError> {
+        if done.iter().any(|p| p.id == id) {
+            return Ok(());
+        }
+        if active.iter().any(|entry| entry == id) {
+            return Err(error(
+                "PLUGIN_CATALOG",
+                "The trusted plugin dependency graph contains a cycle.",
+            ));
+        }
+        let p = packages.iter().find(|p| p.id == id).ok_or_else(|| {
+            error(
+                "PLUGIN_ID",
+                "This plugin or dependency is not in the trusted catalog.",
+            )
+        })?;
+        if p.dependencies.len() > 16
+            || p.dependencies
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != p.dependencies.len()
+        {
+            return Err(error(
+                "PLUGIN_CATALOG",
+                "Invalid or duplicate trusted plugin dependency.",
+            ));
+        }
+        active.push(id.to_owned());
+        for dependency in &p.dependencies {
+            visit(packages, dependency, active, done)?;
+        }
+        active.pop();
+        done.push(p);
+        Ok(())
+    }
+    let mut ordered = Vec::new();
+    visit(packages, id, &mut Vec::new(), &mut ordered)?;
+    if ordered.iter().map(|p| p.total_size()).sum::<usize>() > MAX_PACKAGE {
+        return Err(error(
+            "PLUGIN_TOO_LARGE",
+            "The plugin dependency closure exceeds the bounded load budget.",
+        ));
+    }
+    Ok(ordered)
+}
+fn package(id: &str) -> Result<Package, BridgeError> {
+    catalog()?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| error("PLUGIN_ID", "This plugin is not in the trusted catalog."))
+}
+pub(crate) fn cache_root() -> Result<PathBuf, BridgeError> {
+    let root = workspace_service::application_paths::plugin_root()
+        .map_err(|e| cache_io("Resolve plugin storage", &e))?;
+    prepare_cache_root(root)
+}
+fn prepare_cache_root(root: PathBuf) -> Result<PathBuf, BridgeError> {
+    workspace_service::application_paths::validate_directory_path(&root)
+        .map_err(|e| cache_io("Validate plugin storage", &e))?;
+    std::fs::create_dir_all(&root).map_err(|e| cache_io("Cannot prepare plugin cache", &e))?;
+    for path in [root.clone(), root.parent().unwrap().to_path_buf()] {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| cache_io("Cache metadata", &e))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 != 0 {
+                return Err(error(
+                    "PLUGIN_CACHE",
+                    "A redirected/reparse plugin cache is not allowed.",
+                ));
+            }
+        }
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(error(
+                "PLUGIN_CACHE",
+                "Plugin cache must be a regular directory.",
+            ));
+        }
+    }
+    // Packaged Windows processes can redirect the apparent C: AppData path
+    // to a different volume. Use one physical root for staging and commits,
+    // retaining Windows' verbatim prefix for longer nested resource paths.
+    std::fs::canonicalize(&root)
+        .map_err(|e| error("PLUGIN_CACHE", format!("Resolve plugin cache: {e}")))
+}
+fn path(root: &Path, p: &Package) -> PathBuf {
+    root.join("plugins")
+        .join(&p.category)
+        .join(&p.id)
+        .join(&p.version)
+        .join(if p.relative_path.is_empty() {
+            &p.asset
+        } else {
+            &p.relative_path
+        })
+}
+fn old_directory_path(root: &Path, p: &Package) -> PathBuf {
+    root.join("plugins")
+        .join(&p.id)
+        .join(&p.version)
+        .join(if p.relative_path.is_empty() {
+            &p.asset
+        } else {
+            &p.relative_path
+        })
+}
+fn legacy_paths(root: &Path, p: &Package) -> Vec<PathBuf> {
+    let mut paths = vec![old_directory_path(root, p)];
+    if p.kind == "script" {
+        paths.push(root.join(format!("{}-{}.js", p.id, p.sha256)));
+    }
+    paths
+}
+fn safe_component(value: &str) -> bool {
+    !value.is_empty()
+        && ![".", ".."].contains(&value)
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.')
+}
+fn verify_directory(directory: &Path) -> Result<(), BridgeError> {
+    let meta =
+        std::fs::symlink_metadata(directory).map_err(|e| cache_io("Plugin directory", &e))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err(error(
+                "PLUGIN_CACHE",
+                "Linked/reparse plugin directories are not allowed.",
+            ));
+        }
+    }
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(error(
+            "PLUGIN_CACHE",
+            "Plugin directory must be a regular directory.",
+        ));
+    }
+    Ok(())
+}
+fn verify_parents(root: &Path, file: &Path, create: bool) -> Result<(), BridgeError> {
+    let relative = file
+        .parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .ok_or_else(|| error("PLUGIN_CACHE", "Plugin path escapes its cache root."))?;
+    verify_directory(root)?;
+    let mut parent = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(error("PLUGIN_CACHE", "Invalid plugin path component."));
+        }
+        parent.push(component);
+        if create && !parent.exists() {
+            std::fs::create_dir(&parent)
+                .or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(|e| cache_io("Create plugin directory", &e))?;
+        }
+        verify_directory(&parent)?;
+    }
+    Ok(())
+}
+fn verify(p: &Package, bytes: &[u8]) -> Result<(), BridgeError> {
+    if bytes.len() != p.size
+        || bytes.len() > MAX_SCRIPT
+        || format!("{:x}", Sha256::digest(bytes)) != p.sha256
+    {
+        return Err(error(
+            "PLUGIN_INTEGRITY",
+            format!(
+                "Plugin {} {} asset {} failed size/SHA-256 verification (expected {} bytes, observed {}).",
+                p.id,
+                p.version,
+                p.asset,
+                p.size,
+                bytes.len()
+            ),
+        ));
+    }
+    match p.kind.as_str() {
+        "image" | "thumbnail" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => return Ok(()),
+        "wasm" if bytes.starts_with(b"\0asm\x01\0\0\0") => return Ok(()),
+        "binary" if !p.mime_type.is_empty() && p.mime_type.len() <= 128 => return Ok(()),
+        "script" | "worker" | "style" => {}
+        _ => {
+            return Err(error(
+                "PLUGIN_ENCODING",
+                "The verified plugin resource format is invalid.",
+            ));
+        }
+    }
+    std::str::from_utf8(bytes).map_err(|decode| {
+        error(
+            "PLUGIN_ENCODING",
+            format!("Verified JavaScript UTF-8 decoding failed: validUpTo={}; errorLength={:?}; bytes={}",decode.valid_up_to(),decode.error_len(),bytes.len()),
+        )
+    })?;
+    Ok(())
+}
+pub(crate) fn sources(id: &str) -> Result<Vec<String>, BridgeError> {
+    let packages = catalog()?;
+    let root = cache_root()?;
+    let mut sources = Vec::new();
+    // Construct the entire verified closure before any script reaches the renderer.
+    for p in dependency_order(&packages, id)? {
+        sources.extend(sources_for(&root, p)?);
+    }
+    if sources.is_empty() || sources.len() > 33 || sources.iter().any(|s| s.len() > MAX_SCRIPT) {
+        return Err(error(
+            "PLUGIN_TOO_LARGE",
+            "The plugin exceeds the bounded script batch channel.",
+        ));
+    }
+    Ok(sources)
+}
+fn sources_for(root: &Path, p: &Package) -> Result<Vec<String>, BridgeError> {
+    let mut verified = HashMap::new();
+    for asset in p.assets() {
+        verified.insert(asset.asset.clone(), read_asset(root, &asset)?);
+    }
+    let mut sources = Vec::new();
+    for r in &p.resources {
+        if r.kind == "script" {
+            sources.push(
+                String::from_utf8(verified[&r.asset].clone()).map_err(|decode| {
+                    error(
+                        "PLUGIN_ENCODING",
+                        format!(
+                            "Resource script UTF-8 decoding failed: validUpTo={}; errorLength={:?}",
+                            decode.utf8_error().valid_up_to(),
+                            decode.utf8_error().error_len()
+                        ),
+                    )
+                })?,
+            );
+            continue;
+        }
+        if ["style", "worker", "wasm", "binary"].contains(&r.kind.as_str()) {
+            sources.extend(resource_sources(p, r, &verified[&r.asset]));
+            continue;
+        }
+        if r.kind != "image" {
+            continue;
+        }
+        let mut item = r
+            .image
+            .clone()
+            .ok_or_else(|| error("PLUGIN_CATALOG", "Image metadata is missing"))?;
+        let metadata = item
+            .as_object_mut()
+            .ok_or_else(|| error("PLUGIN_CATALOG", "Image metadata must be an object"))?;
+        let thumbnail = metadata.remove("thumbnailAsset");
+        metadata.insert(
+            "data".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(&verified[&r.asset])),
+        );
+        if let Some(asset) = thumbnail.and_then(|v| v.as_str().map(str::to_owned)) {
+            let thumbnail = verified
+                .get(&asset)
+                .ok_or_else(|| error("PLUGIN_CATALOG", "The default image thumbnail is missing"))?;
+            metadata.insert(
+                "thumbnail".into(),
+                json!(base64::engine::general_purpose::STANDARD.encode(thumbnail)),
+            );
+        }
+        let source = format!(
+            "(()=>{{const key=Symbol.for('code-codex:default-galleries:v1');const registry=window[key]??(window[key]=new Map());let gallery=registry.get({id});if(!gallery||gallery.version!=={version})registry.set({id},gallery={{version:{version},count:{count},images:new Map()}});gallery.images.set({hash},{item});}})();",
+            id = json!(p.id),
+            version = p.gallery_version,
+            count = p.default_image_count,
+            hash = json!(r.sha256),
+            item = item
+        );
+        if source.len() > MAX_SCRIPT {
+            return Err(error(
+                "PLUGIN_TOO_LARGE",
+                "Default image registration exceeds the bounded script channel.",
+            ));
+        }
+        sources.push(source);
+    }
+    sources.push(
+        String::from_utf8(verified[&p.asset].clone()).map_err(|decode| {
+            error(
+                "PLUGIN_ENCODING",
+                format!(
+                    "Main script UTF-8 decoding failed: validUpTo={}; errorLength={:?}",
+                    decode.utf8_error().valid_up_to(),
+                    decode.utf8_error().error_len()
+                ),
+            )
+        })?,
+    );
+    // This marker is emitted only after every asset has been read and verified
+    // and after the package's main registration script. It allows the early
+    // startup loader and the later core UI to share the same verified identity.
+    sources.push(verified_module_source(p));
+    Ok(sources)
+}
+fn verified_module_source(p: &Package) -> String {
+    let fingerprint = json!([
+        p.api,
+        p.version,
+        p.sha256,
+        p.resources.iter().map(|r| &r.sha256).collect::<Vec<_>>()
+    ]);
+    format!(
+        "(()=>{{const id={id};const module=window[Symbol.for('code-codex:plugin-modules:v1')]?.get(id)??window[Symbol.for('code-codex:background-modules:v1')]?.get(id);if(module?.api==={api}&&module.version==={version}){{const key=Symbol.for('code-codex:verified-plugin-modules:v1');const registry=window[key]??(window[key]=new Map());registry.set(id,{{fingerprint:JSON.stringify({fingerprint}),module}});}}}})();",
+        id = json!(p.id),
+        api = p.api,
+        version = json!(p.version),
+        fingerprint = fingerprint
+    )
+}
+fn resource_sources(p: &Package, r: &Resource, bytes: &[u8]) -> Vec<String> {
+    let mut sources = Vec::new();
+    let mime = if r.mime_type.is_empty() {
+        match r.kind.as_str() {
+            "style" => "text/css",
+            "worker" => "application/javascript",
+            "wasm" => "application/wasm",
+            _ => "application/octet-stream",
+        }
+    } else {
+        &r.mime_type
+    };
+    // Raw resources remain data. Worker scripts never run in the main context;
+    // the plugin creates and disposes its own Blob/Worker using these verified bytes.
+    for (index, chunk) in bytes.chunks(RESOURCE_CHUNK).enumerate() {
+        let init = if index == 0 {
+            format!(
+                "let resources=registry.get({id});if(!resources||resources.version!=={version})registry.set({id},resources={{version:{version},resources:new Map()}});resources.resources.set({path},{{kind:{kind},mimeType:{mime},bytes:new Uint8Array({size})}});",
+                id = json!(p.id),
+                version = json!(p.version),
+                path = json!(r.relative_path),
+                kind = json!(r.kind),
+                mime = json!(mime),
+                size = bytes.len()
+            )
+        } else {
+            String::new()
+        };
+        sources.push(format!("(()=>{{const key=Symbol.for('code-codex:plugin-resources:v1');const registry=window[key]??(window[key]=new Map());{init}const bytes=Uint8Array.from(atob({data}),c=>c.charCodeAt(0));registry.get({id}).resources.get({path}).bytes.set(bytes,{offset});}})();",
+            data=json!(base64::engine::general_purpose::STANDARD.encode(chunk)),
+            id=json!(p.id), path=json!(r.relative_path), offset=index*RESOURCE_CHUNK));
+    }
+    sources
+}
+fn read_verified_file(root: &Path, file: &Path, p: &Package) -> Result<Vec<u8>, BridgeError> {
+    verify_parents(root, file, false)?;
+    let meta = std::fs::symlink_metadata(file).map_err(|e| {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return cache_io("Required asset metadata", &e);
+        }
+        error(
+            "PLUGIN_NOT_INSTALLED",
+            format!(
+                "Download {} in Preview Market first; required asset {} is missing.",
+                p.name, p.asset
+            ),
+        )
+    })?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err(error(
+                "PLUGIN_INTEGRITY",
+                "Linked/reparse plugin cache files are not allowed.",
+            ));
+        }
+    }
+    if !meta.is_file() || meta.len() != p.size as u64 || meta.file_type().is_symlink() {
+        return Err(error(
+            "PLUGIN_INTEGRITY",
+            "Cached plugin size or file type is invalid.",
+        ));
+    }
+    let bytes = std::fs::read(file).map_err(|e| cache_io("Read plugin", &e))?;
+    verify(p, &bytes)?;
+    Ok(bytes)
+}
+fn read_asset(root: &Path, p: &Package) -> Result<Vec<u8>, BridgeError> {
+    let sidecar = bundled_root();
+    read_asset_with_sidecar(root, p, sidecar.as_deref())
+}
+fn bundled_root() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    std::fs::canonicalize(executable.parent()?).ok()
+}
+fn read_asset_with_sidecar(
+    root: &Path,
+    p: &Package,
+    sidecar: Option<&Path>,
+) -> Result<Vec<u8>, BridgeError> {
+    let file = path(root, p);
+    // A present cache entry must pass its checks; a damaged entry cannot be bypassed.
+    match std::fs::symlink_metadata(&file) {
+        Ok(_) => return read_verified_file(root, &file, p),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(cache_io("Cached asset metadata", &e)),
+    }
+    if p.local_only {
+        if let Some(directory) = sidecar {
+            let bundled = directory.join(&p.asset);
+            match std::fs::symlink_metadata(&bundled) {
+                Ok(_) => {
+                    let bytes = read_verified_file(directory, &bundled, p)?;
+                    crate::runtime_log::record(
+                        "plugin-package",
+                        "bundled player load",
+                        "passed",
+                        json!({"id":p.id,"version":p.version,"integrityVerified":true,"networkRequested":false}),
+                    );
+                    return Ok(bytes);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(cache_io("Bundled player metadata", &e)),
+            }
+        }
+    }
+    if !file.exists() {
+        for legacy in legacy_paths(root, p) {
+            if std::fs::symlink_metadata(&legacy).is_err() {
+                continue;
+            }
+            let bytes = read_verified_file(root, &legacy, p)?;
+            commit(
+                root,
+                p,
+                &bytes,
+                tempfile::NamedTempFile::new_in(root)
+                    .map_err(|e| cache_io("Migration staging", &e))?,
+            )?;
+            crate::runtime_log::record(
+                "plugin-package",
+                "cache migration",
+                "passed",
+                json!({"id":p.id,"category":p.category,"version":p.version,"asset":p.asset}),
+            );
+            break;
+        }
+    }
+    if p.local_only && !file.exists() {
+        require_public_download(p)?;
+    }
+    let bytes = read_verified_file(root, &file, p)?;
+    crate::runtime_log::record(
+        "plugin-package",
+        "cache load",
+        "verified",
+        json!({"id":p.id,"category":p.category,"version":p.version,"asset":p.asset,"bytes":bytes.len()}),
+    );
+    Ok(bytes)
+}
+fn require_public_download(p: &Package) -> Result<(), BridgeError> {
+    if p.local_only {
+        return Err(error(
+            "PLUGIN_LOCAL_ASSET",
+            "The local startup player is missing or invalid. Repair the local Code-Codex installation; this player is supplied with its installer and is not downloaded from GitHub.",
+        ));
+    }
+    Ok(())
+}
+pub(crate) fn status() -> Result<Value, BridgeError> {
+    let root = cache_root()?;
+    let packages = catalog()?;
+    let jobs = jobs()
+        .lock()
+        .map_err(|_|error("PLUGIN_STATE","Plugin download state lock is poisoned; operation state could not be inspected safely; no lock bypass was attempted."))?;
+    Ok(Value::Array(packages.iter().map(|p|{
+        let job=jobs.get(&p.id);
+        let closure=dependency_order(&packages,&p.id).expect("catalog dependencies were validated");
+        json!({"id":p.id,"category":p.category,"version":p.version,"installed":closure.iter().all(|p|p.assets().iter().all(|asset|source_available(&root,asset))),"phase":job.map(|j|j.phase),"downloaded":job.map(|j|j.bytes).unwrap_or(0),"total":closure.iter().map(|p|p.total_size()).sum::<usize>(),"error":job.and_then(|j|j.error.as_ref())})
+    }).collect()))
+}
+fn source_available(root: &Path, p: &Package) -> bool {
+    let current = path(root, p);
+    // A current malformed entry must not be silently bypassed by legacy data.
+    if std::fs::symlink_metadata(&current).is_ok() {
+        return read_verified_file(root, &current, p).is_ok();
+    }
+    if let Some(file) = legacy_paths(root, p)
+        .iter()
+        .find(|file| std::fs::symlink_metadata(file).is_ok())
+    {
+        return read_verified_file(root, file, p).is_ok();
+    }
+    p.local_only
+        && bundled_root().is_some_and(|directory| {
+            read_verified_file(&directory, &directory.join(&p.asset), p).is_ok()
+        })
+}
+/// Explicit support audit, never prepares directories or migrates user files.
+pub(crate) fn diagnostic_status() -> Result<Value, BridgeError> {
+    let root = workspace_service::application_paths::plugin_root()
+        .map_err(|e| cache_io("Resolve plugin audit storage", &e))?;
+    match std::fs::symlink_metadata(&root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({"cache":"absent","normalForFreshInstall":true,"created":false}));
+        }
+        Err(e) => return Err(cache_io("Audit cache metadata", &e)),
+        Ok(_) => {
+            verify_directory(&root)?;
+            verify_directory(root.parent().expect("fixed cache parent"))?;
+        }
+    }
+    let packages = catalog()?;
+    let mut checks = vec![];
+    for p in &packages {
+        let mut verified = 0;
+        let mut missing = 0;
+        let mut failures = vec![];
+        for asset in p.assets() {
+            let current = path(&root, &asset);
+            let candidate = match std::fs::symlink_metadata(&current) {
+                Ok(_) => Some(current),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => legacy_paths(&root, &asset)
+                    .into_iter()
+                    .find(|file| std::fs::symlink_metadata(file).is_ok()),
+                Err(e) => {
+                    failures.push(json!({"asset":asset.asset,"code":"PLUGIN_CACHE","ioKind":format!("{:?}",e.kind()),"osCode":e.raw_os_error()}));
+                    continue;
+                }
+            };
+            let Some(file) = candidate else {
+                if asset.local_only
+                    && bundled_root().is_some_and(|directory| {
+                        read_verified_file(&directory, &directory.join(&asset.asset), &asset)
+                            .is_ok()
+                    })
+                {
+                    verified += 1;
+                    continue;
+                }
+                missing += 1;
+                continue;
+            };
+            match read_verified_file(&root, &file, &asset) {
+                Ok(_) => verified += 1,
+                Err(e) => {
+                    let observation = json!({"id":p.id,"asset":asset.asset,"version":p.version,"code":e.code,"reason":e.message});
+                    crate::runtime_log::record(
+                        "plugin-cache",
+                        "asset audit",
+                        "failed",
+                        observation.clone(),
+                    );
+                    failures.push(observation)
+                }
+            }
+        }
+        checks.push(json!({"id":p.id,"category":p.category,"version":p.version,"verifiedAssets":verified,"missingAssets":missing,"failedAssets":failures.len(),"failures":failures,"dependencies":p.dependencies,"state":if !failures.is_empty(){"invalid"}else if missing>0{"not fully downloaded"}else{"own assets verified"}}));
+    }
+    Ok(
+        json!({"cache":"audited","packages":checks,"readOnly":true,"interpretation":"Own assets and dependencies are reported separately. Missing downloads are normal; verified does not prove loaded or enabled."}),
+    )
+}
+pub(crate) fn cancel(id: &str) -> Result<Value, BridgeError> {
+    package(id)?;
+    let jobs = jobs()
+        .lock()
+        .map_err(|_|error("PLUGIN_STATE","Plugin download state lock is poisoned; operation state could not be inspected safely; no lock bypass was attempted."))?;
+    if let Some(job) = jobs.get(id) {
+        job.cancel.cancel();
+    }
+    crate::runtime_log::record(
+        "plugin-package",
+        "cancel",
+        "requested",
+        json!({"id":id,"activeJob":jobs.contains_key(id)}),
+    );
+    Ok(json!({"cancelRequested":true}))
+}
+struct JobGuard(String);
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut jobs) = jobs().lock() {
+            if let Some(j) = jobs.get_mut(&self.0) {
+                if !["installed", "failed", "cancelled"].contains(&j.phase) {
+                    j.phase = "cancelled";
+                }
+            }
+        }
+    }
+}
+fn progress(id: &str, phase: &'static str, bytes: usize) {
+    if let Ok(mut jobs) = jobs().lock() {
+        if let Some(j) = jobs.get_mut(id) {
+            j.phase = phase;
+            j.bytes = bytes;
+        }
+    }
+}
+fn trusted_url(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(
+            url.host_str(),
+            Some(
+                "github.com"
+                    | "release-assets.githubusercontent.com"
+                    | "objects.githubusercontent.com"
+            )
+        )
+}
+pub(crate) async fn install(id: &str) -> Result<Value, BridgeError> {
+    let mut operation =
+        crate::runtime_log::Operation::start("plugin-package", "download", json!({"id":id}));
+    let result = install_inner(id, &operation).await;
+    let job = jobs().lock().ok().and_then(|jobs| {
+        jobs.get(id)
+            .map(|j| json!({"phase":j.phase,"receivedBytes":j.bytes}))
+    });
+    match &result {
+        Ok(value)=>operation.finish("passed",json!({"id":id,"cached":value.get("cached").and_then(Value::as_bool).unwrap_or(false),"job":job})),
+        Err(e)=>operation.finish(if e.code=="PLUGIN_CANCELLED" {"cancelled"}else{"failed"},json!({"id":id,"code":e.code,"reason":e.message,"job":job})),
+    }
+    result
+}
+async fn install_inner(
+    id: &str,
+    operation: &crate::runtime_log::Operation,
+) -> Result<Value, BridgeError> {
+    let p = package(id)?;
+    let packages = catalog()?;
+    let closure = dependency_order(&packages, id)?;
+    if sources(id).is_ok() {
+        return Ok(
+            json!({"id":id,"category":p.category,"version":p.version,"installed":true,"cached":true}),
+        );
+    }
+    let cancel = CancellationToken::new();
+    {
+        let mut jobs = jobs()
+            .lock()
+            .map_err(|_|error("PLUGIN_STATE","Plugin download state lock is poisoned; operation state could not be inspected safely; no lock bypass was attempted."))?;
+        if jobs
+            .get(id)
+            .is_some_and(|j| ["downloading", "verifying", "committing"].contains(&j.phase))
+        {
+            return Err(error("PLUGIN_BUSY", "This plugin is already downloading."));
+        }
+        if jobs
+            .values()
+            .filter(|j| ["downloading", "verifying", "committing"].contains(&j.phase))
+            .count()
+            >= 3
+        {
+            return Err(error(
+                "PLUGIN_BUSY",
+                "Three plugin downloads are already running.",
+            ));
+        }
+        jobs.insert(
+            id.to_owned(),
+            Job {
+                cancel: cancel.clone(),
+                phase: "downloading",
+                bytes: 0,
+                error: None,
+            },
+        );
+    }
+    let _guard = JobGuard(id.to_owned());
+    operation.event(
+        "download plan",
+        "prepared",
+        json!({"id":id,"category":p.category,"version":p.version,"expectedBytes":closure.iter().map(|p|p.total_size()).sum::<usize>(),"resourceCount":p.resources.len(),"dependencyCount":closure.len()-1}),
+    );
+    let result = tokio::select! {
+        ()=cancel.cancelled()=>Err(error("PLUGIN_CANCELLED","Plugin download was cancelled.")),
+        result=tokio::time::timeout(Duration::from_secs(120),download(&p,&closure, operation))=>result.map_err(|_|crate::network_diagnostics::timeout_error("PLUGIN","package download","plugin package and resources",120_000,None)).and_then(|result|result),
+    };
+    if let Err(e) = &result {
+        if let Ok(mut jobs) = jobs().lock() {
+            if let Some(j) = jobs.get_mut(id) {
+                j.phase = if cancel.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                j.error = Some(e.message.clone());
+            }
+        }
+    }
+    result
+}
+async fn download(
+    p: &Package,
+    closure: &[&Package],
+    operation: &crate::runtime_log::Operation,
+) -> Result<Value, BridgeError> {
+    let root = cache_root()?;
+    let mut completed = 0;
+    for dependency in closure {
+        for asset in dependency.assets() {
+            operation.event("asset selection", "started", json!({"id":asset.id,"asset":asset.asset,"releaseTag":asset.release_tag,"kind":asset.kind,"expectedBytes":asset.size,"completedBytes":completed}));
+            if source_available(&root, &asset) {
+                // Upgrade the categorized location using verified old bytes, without HTTP.
+                read_asset(&root, &asset)?;
+                operation.event(
+                    "asset selection",
+                    "cached",
+                    json!({"id":asset.id,"asset":asset.asset,"expectedBytes":asset.size}),
+                );
+            } else {
+                download_asset(&asset, completed, &p.id, operation.id()).await?;
+            }
+            completed += asset.size;
+            progress(&p.id, "downloading", completed);
+        }
+    }
+    sources(&p.id)?;
+    operation.event("package availability", "verified", json!({"id":p.id,"verifiedBytes":completed,"dependencyCount":closure.len()-1,"enabledAutomatically":false}));
+    progress(&p.id, "installed", completed);
+    Ok(json!({"id":p.id,"category":p.category,"installed":true,"version":p.version}))
+}
+async fn download_asset(
+    p: &Package,
+    completed: usize,
+    progress_id: &str,
+    parent_operation: u64,
+) -> Result<Value, BridgeError> {
+    require_public_download(p)?;
+    let endpoint = format!(
+        "https://github.com/Rice-dog/code-codex/releases/download/{}/{}",
+        p.release_tag, p.asset
+    );
+    let mut trace = crate::network_diagnostics::HttpTrace::start(
+        "plugin-package",
+        &endpoint,
+        10_000,
+        120_000,
+        json!({"id":p.id,"asset":p.asset,"releaseTag":p.release_tag,"expectedBytes":p.size,"parentOperationId":parent_operation}),
+    );
+    let request_operation = trace.operation.id();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            let allowed = attempt.previous().len() <= 5 && trusted_url(attempt.url());
+            crate::runtime_log::record("plugin-package", "HTTP redirect", if allowed {"followed"}else{"rejected"}, json!({"operationId":request_operation,"status":attempt.status().as_u16(),"fromHost":attempt.previous().last().and_then(|u|u.host_str()),"toHost":attempt.url().host_str(),"redirectCount":attempt.previous().len(),"trusted":trusted_url(attempt.url())}));
+            if !allowed {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|e| {trace.fail("client build", &e, 0); crate::network_diagnostics::transport_error("PLUGIN","client build",&p.id,&e)})?;
+    let role = format!("plugin={} version={} release={} asset={}",p.id,p.version,p.release_tag,p.asset);
+    let response = trace.send(client.get(&endpoint)).await.map_err(|e|
+        crate::network_diagnostics::transport_error("PLUGIN","send",&role,&e))?;
+    if !response.status().is_success() {
+        let error = crate::network_diagnostics::http_error("PLUGIN",&role,&response);
+        trace.operation.finish("failed",json!({"phase":"HTTP response validation","code":error.code,"status":response.status().as_u16()}));
+        return Err(error);
+    }
+    if !trusted_url(response.url()) {
+        return Err(error("PLUGIN_REDIRECT","The plugin response used an untrusted host; download rejected."));
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len != p.size as u64)
+    {
+        trace.operation.finish("failed",json!({"phase":"length validation","code":"PLUGIN_INTEGRITY","expectedBytes":p.size,"observedLength":response.content_length()}));
+        return Err(error(
+            "PLUGIN_INTEGRITY",
+            "Plugin HTTP Content-Length does not match the trusted catalog.",
+        ));
+    }
+    let root = cache_root()?;
+    let result = receive_asset(p, response, &root, completed, progress_id, &mut trace).await;
+    match &result {
+        Ok(_) => trace.operation.finish(
+            "passed",
+            json!({"receivedBytes":p.size,"integrityVerified":true,"cacheCommitted":true}),
+        ),
+        Err(e) => trace
+            .operation
+            .finish("failed", json!({"code":e.code,"reason":e.message})),
+    }
+    result
+}
+#[cfg(test)]
+async fn receive(
+    p: &Package,
+    response: reqwest::Response,
+    root: &Path,
+) -> Result<Value, BridgeError> {
+    let mut trace = crate::network_diagnostics::HttpTrace::start(
+        "plugin-package",
+        "http://localhost",
+        10_000,
+        120_000,
+        json!({"fixture":true}),
+    );
+    let result = receive_asset(p, response, root, 0, &p.id, &mut trace).await;
+    trace.operation.finish(
+        if result.is_ok() { "passed" } else { "failed" },
+        json!({"fixture":true}),
+    );
+    result
+}
+async fn receive_asset(
+    p: &Package,
+    mut response: reqwest::Response,
+    root: &Path,
+    completed: usize,
+    progress_id: &str,
+    trace: &mut crate::network_diagnostics::HttpTrace,
+) -> Result<Value, BridgeError> {
+    trace.operation.event(
+        "cache staging",
+        "started",
+        json!({"id":p.id,"asset":p.asset}),
+    );
+    let staging =
+        tempfile::NamedTempFile::new_in(&root).map_err(|e| cache_io("Plugin staging", &e))?;
+    let mut bytes = Vec::with_capacity(p.size);
+    let mut transfer = crate::network_diagnostics::TransferProgress::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        trace.fail("body stream", &e, bytes.len() as u64);
+        crate::network_diagnostics::transport_error("PLUGIN","body stream",&format!("plugin={} asset={} receivedBytes={}",p.id,p.asset,bytes.len()),&e)
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > p.size {
+            return Err(error(
+                "PLUGIN_INTEGRITY",
+                "Plugin stream exceeded its trusted size.",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+        transfer.observe(&trace.operation, bytes.len() as u64, p.size as u64);
+        progress(progress_id, "downloading", completed + bytes.len());
+    }
+    progress(progress_id, "verifying", completed + bytes.len());
+    trace.operation.event("integrity", "started",json!({"id":p.id,"asset":p.asset,"expectedBytes":p.size,"receivedBytes":bytes.len(),"expectedSha256":p.sha256,"observedSha256":format!("{:x}",Sha256::digest(&bytes))}));
+    verify(p, &bytes)?;
+    trace.operation.event(
+        "integrity",
+        "passed",
+        json!({"id":p.id,"asset":p.asset,"version":p.version,"bytes":bytes.len()}),
+    );
+    trace.operation.event(
+        "cache commit",
+        "started",
+        json!({"id":p.id,"asset":p.asset}),
+    );
+    commit(&root, p, &bytes, staging)?;
+    progress(progress_id, "downloading", completed + bytes.len());
+    trace.operation.event(
+        "install",
+        "committed",
+        json!({"id":p.id,"asset":p.asset,"version":p.version,"bytes":bytes.len()}),
+    );
+    Ok(json!({"id":p.id,"installed":true,"version":p.version}))
+}
+fn commit(
+    root: &Path,
+    p: &Package,
+    bytes: &[u8],
+    mut staging: tempfile::NamedTempFile,
+) -> Result<(), BridgeError> {
+    use std::io::Write;
+    verify(p, bytes)?;
+    progress(&p.id, "committing", bytes.len());
+    staging
+        .write_all(bytes)
+        .and_then(|()| staging.as_file().sync_all())
+        .map_err(|e| cache_io("Write plugin staging", &e))?;
+    let destination = path(root, p);
+    verify_parents(root, &destination, true)?;
+    if destination.exists() {
+        let meta = std::fs::symlink_metadata(&destination)
+            .map_err(|e| cache_io("Invalid cache metadata", &e))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 != 0 {
+                return Err(error(
+                    "PLUGIN_CACHE",
+                    "Cannot replace a linked/reparse cache file.",
+                ));
+            }
+        }
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err(error(
+                "PLUGIN_CACHE",
+                "Cannot replace a non-regular cache file.",
+            ));
+        }
+        let existing = std::fs::read(&destination).map_err(|e| cache_io("Existing plugin", &e))?;
+        if verify(p, &existing).is_ok() {
+            return Ok(());
+        }
+        std::fs::remove_file(&destination)
+            .map_err(|e| cache_io("Remove damaged plugin cache", &e))?;
+        crate::runtime_log::record(
+            "plugin-package",
+            "cache repair",
+            "removed damaged package",
+            json!({"id":p.id}),
+        );
+    }
+    if let Err(e) = staging.persist_noclobber(&destination) {
+        // A second Code-Codex process may have committed the same immutable
+        // package first. Accept only an independently verified regular winner.
+        if !source_available(root, p) {
+            return Err(cache_io("Commit plugin", &e.error));
+        }
+    }
+    Ok(())
+}
+
+/// Offline installation accepts only the exact files/hashes already trusted by
+/// this core. It does not add user-selected code or change the release catalog.
+pub(crate) fn import_directory(directory: &Path) -> Result<Value, BridgeError> {
+    let root = cache_root()?;
+    let mut imported = Vec::new();
+    for p in catalog()? {
+        let Some(base) = [
+            directory.join("plugins").join(&p.category).join(&p.id),
+            directory.join(&p.category).join(&p.id),
+            directory.join("plugins").join(&p.id),
+            directory.join(&p.id),
+            directory.to_path_buf(),
+        ]
+        .into_iter()
+        .find(|base| base.join(&p.asset).exists()) else {
+            continue;
+        };
+        for p in p.assets() {
+            let input = base.join(if p.relative_path.is_empty() {
+                &p.asset
+            } else {
+                &p.relative_path
+            });
+            verify_parents(directory, &input, false)?;
+            if !input.exists() {
+                return Err(error(
+                    "PLUGIN_IMPORT",
+                    format!("Missing default-media asset: {}", p.asset),
+                ));
+            }
+            let meta = std::fs::symlink_metadata(&input)
+                .map_err(|e| error("PLUGIN_IMPORT", format!("Import metadata: {e}")))?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if meta.file_attributes() & 0x400 != 0 {
+                    return Err(error(
+                        "PLUGIN_IMPORT",
+                        "Linked/reparse import files are not allowed.",
+                    ));
+                }
+            }
+            if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != p.size as u64 {
+                return Err(error(
+                    "PLUGIN_IMPORT",
+                    format!("{} is not the expected regular package file.", p.id),
+                ));
+            }
+            let bytes = std::fs::read(&input)
+                .map_err(|e| error("PLUGIN_IMPORT", format!("Read import: {e}")))?;
+            verify(&p, &bytes)?;
+            commit(
+                &root,
+                &p,
+                &bytes,
+                tempfile::NamedTempFile::new_in(&root)
+                    .map_err(|e| cache_io("Import staging", &e))?,
+            )?;
+        }
+        imported.push(p.id);
+    }
+    Ok(json!({"imported":imported}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn local_player(bytes: &[u8]) -> Package {
+        serde_json::from_value(json!({
+            "id":"codex-startup-transition","category":"appearance","name":"Local startup player",
+            "api":1,"version":"1.1.26-local.1","releaseTag":"v0.4.52","localOnly":true,
+            "asset":"CodeCodex-plugin-codex-startup-transition-1.1.26-local.1.js",
+            "relativePath":"CodeCodex-plugin-codex-startup-transition-1.1.26-local.1.js",
+            "size":bytes.len(),"sha256":format!("{:x}",Sha256::digest(bytes)),"kind":"script"
+        }))
+        .unwrap()
+    }
+    #[test]
+    fn local_player_loads_verified_sidecar_with_empty_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let sidecar = tempfile::tempdir().unwrap();
+        let bytes = b"window.localPlayer = true;";
+        let package = local_player(bytes);
+        assert!(valid_package(&package), "Bundled player must pass the production catalog gate");
+        std::fs::write(sidecar.path().join(&package.asset), bytes).unwrap();
+        assert_eq!(
+            read_asset_with_sidecar(cache.path(), &package, Some(sidecar.path())).unwrap(),
+            bytes
+        );
+        assert!(
+            !path(cache.path(), &package).exists(),
+            "Reading sidecar must not need a cache migration"
+        );
+    }
+    #[tokio::test]
+    async fn local_player_cannot_request_unpublished_asset() {
+        let package = local_player(b"window.localPlayer = true;");
+        assert_eq!(
+            require_public_download(&package).unwrap_err().code,
+            "PLUGIN_LOCAL_ASSET"
+        );
+        assert_eq!(
+            download_asset(&package, 0, &package.id, 0)
+                .await
+                .unwrap_err()
+                .code,
+            "PLUGIN_LOCAL_ASSET"
+        );
+        assert!(require_public_download(&fixture_package(b"public fixture")).is_ok());
+    }
+    #[test]
+    fn local_player_missing_sidecar_is_actionable_and_public_plugins_cannot_use_it() {
+        let cache = tempfile::tempdir().unwrap();
+        let sidecar = tempfile::tempdir().unwrap();
+        let bytes = b"window.localPlayer = true;";
+        let mut package = local_player(bytes);
+        assert_eq!(
+            read_asset_with_sidecar(cache.path(), &package, Some(sidecar.path()))
+                .unwrap_err()
+                .code,
+            "PLUGIN_LOCAL_ASSET"
+        );
+        std::fs::write(sidecar.path().join(&package.asset), bytes).unwrap();
+        package.local_only = false;
+        assert!(read_asset_with_sidecar(cache.path(), &package, Some(sidecar.path())).is_err());
+    }
+    #[test]
+    fn local_player_rejects_corrupt_sidecar_and_corrupt_current_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let sidecar = tempfile::tempdir().unwrap();
+        let bytes = b"window.localPlayer = true;";
+        let package = local_player(bytes);
+        std::fs::write(sidecar.path().join(&package.asset), b"tampered").unwrap();
+        assert!(read_asset_with_sidecar(cache.path(), &package, Some(sidecar.path())).is_err());
+        std::fs::write(sidecar.path().join(&package.asset), bytes).unwrap();
+        std::fs::write(test_path(cache.path(), &package), b"tampered").unwrap();
+        assert!(
+            read_asset_with_sidecar(cache.path(), &package, Some(sidecar.path())).is_err(),
+            "Corrupt cache cannot be silently bypassed"
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn commits_resources_beyond_windows_legacy_path_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let local = temporary.path().join("long-app-data-path".repeat(6));
+        let root = prepare_cache_root(local.join("CodeCodex").join("plugin-cache")).unwrap();
+        let bytes = b"verified resource";
+        let mut package = fixture_package(bytes);
+        package.relative_path = format!("resources/{}", "resource-name".repeat(9));
+        assert!(path(&root, &package).as_os_str().len() > 260);
+        commit(
+            &root,
+            &package,
+            bytes,
+            tempfile::NamedTempFile::new_in(&root).unwrap(),
+        )
+        .unwrap();
+        assert!(source_available(&root, &package));
+    }
+    fn test_path(root: &Path, p: &Package) -> PathBuf {
+        let file = path(root, p);
+        verify_parents(root, &file, true).unwrap();
+        file
+    }
+    #[test]
+    fn resource_releases_can_reuse_verified_old_media_but_never_accept_urls() {
+        let package=catalog().unwrap().into_iter().find(|p|p.id=="pixel-sculpt").unwrap();
+        assert!(package.resources.iter().any(|r|!r.release_tag.is_empty() && r.release_tag!=package.release_tag));
+        for resource in &package.resources {
+            let asset=package.assets().into_iter().find(|a|a.asset==resource.asset).unwrap();
+            assert_eq!(asset.release_tag,if resource.release_tag.is_empty(){package.release_tag.clone()}else{resource.release_tag.clone()});
+        }
+        let mut invalid=package;invalid.resources[0].release_tag="https://invalid.example/escape".into();assert!(!valid_package(&invalid));
+        invalid.resources[0].release_tag="v../escape".into();assert!(!valid_package(&invalid));
+    }
+
+    #[test]
+    fn dated_asset_release_tags_preserve_cache_identity_and_reject_unsafe_paths() {
+        let mut package = catalog().unwrap().into_iter().find(|p| !p.resources.is_empty()).unwrap();
+        let fingerprint = verified_module_source(&package);
+        package.release_tag = "plugin-assets-2026-10-18".into();
+        assert!(valid_package(&package));
+        assert_eq!(fingerprint, verified_module_source(&package));
+        package.resources[0].release_tag = package.release_tag.clone();
+        assert!(valid_package(&package));
+        for tag in ["plugin-assets-2026-10-18/escape", "plugin-assets-2026-10-18%2fescape",
+            "plugin-assets-2026-1-18", "plugin-assets-2026-10-18\n", "plugin-assets-latest", "https://invalid/"] {
+            assert!(!valid_release_tag(tag), "{tag:?}");
+        }
+        let bytes = b"verified unchanged package";
+        let mut cached = fixture_package(bytes);
+        let root = tempfile::tempdir().unwrap();
+        let original_path = path(root.path(), &cached);
+        std::fs::create_dir_all(original_path.parent().unwrap()).unwrap();
+        std::fs::write(&original_path, bytes).unwrap();
+        cached.release_tag = "plugin-assets-2026-10-18".into();
+        assert_eq!(original_path, path(root.path(), &cached));
+        assert!(source_available(root.path(), &cached));
+        assert_eq!(read_asset(root.path(), &cached).unwrap(), bytes);
+    }
+
+    #[test]
+    fn catalog_is_bounded_unique_and_pinned() {
+        let packages = catalog().unwrap();
+        assert!(packages.len() >= 10);
+        let mut ids = std::collections::HashSet::new();
+        for p in packages {
+            assert!(ids.insert(p.id.clone()));
+            assert_eq!(p.api, 1);
+            assert!(trusted_asset(&p, &p.asset));
+            assert!(CATEGORIES.contains(&p.category.as_str()));
+            assert!(p.size <= MAX_SCRIPT);
+            assert!(!p.id.contains('/'));
+            assert!(package(&p.id).is_ok());
+        }
+    }
+
+    #[test]
+    fn default_companions_are_required_and_individually_verified() {
+        let first = b"default photo metadata";
+        let mut p = fixture_package(b"main renderer");
+        p.resources.push(Resource {
+            release_tag: String::new(),
+            asset: "CodeCodex-plugin-fixture-default-photo.js".into(),
+            relative_path: String::new(),
+            kind: script_kind(),
+            image: None,
+            mime_type: String::new(),
+            size: first.len(),
+            sha256: format!("{:x}", Sha256::digest(first)),
+        });
+        let assets = p.assets();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(p.total_size(), first.len() + p.size);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(test_path(root.path(), &assets[1]), b"main renderer").unwrap();
+        assert!(
+            !assets
+                .iter()
+                .all(|asset| source_available(root.path(), asset))
+        );
+        std::fs::write(test_path(root.path(), &assets[0]), first).unwrap();
+        assert!(
+            assets
+                .iter()
+                .all(|asset| source_available(root.path(), asset))
+        );
+        std::fs::write(test_path(root.path(), &assets[0]), b"corrupted").unwrap();
+        assert!(
+            !assets
+                .iter()
+                .all(|asset| source_available(root.path(), asset))
+        );
+    }
+    #[test]
+    fn integrity_rejects_truncation_and_changed_bytes() {
+        let bytes = b"verified script";
+        let p = Package {
+            id: "test".into(),
+            category: appearance_category(),
+            name: "Test".into(),
+            api: 1,
+            version: "1.0.0".into(),
+            release_tag: "v0.3.92".into(),
+            size: bytes.len(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            asset: "test.js".into(),
+            resources: Vec::new(),
+            kind: script_kind(),
+            ..Default::default()
+        };
+        assert!(verify(&p, bytes).is_ok());
+        assert!(verify(&p, &bytes[1..]).is_err());
+        assert!(verify(&p, b"modified script").is_err());
+        let root = tempfile::tempdir().unwrap();
+        commit(
+            root.path(),
+            &p,
+            bytes,
+            tempfile::NamedTempFile::new_in(root.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(test_path(root.path(), &p)).unwrap(), bytes);
+    }
+    #[test]
+    fn trusted_origins_reject_userinfo_http_ports_and_other_repositories() {
+        for bad in [
+            "http://github.com/x",
+            "https://evil.example/x",
+            "https://github.com:444/x",
+            "https://user@github.com/x",
+        ] {
+            assert!(!trusted_url(&url::Url::parse(bad).unwrap()));
+        }
+        assert!(trusted_url(
+            &url::Url::parse("https://release-assets.githubusercontent.com/x").unwrap()
+        ));
+        assert!(package("../../evil").is_err());
+    }
+    fn fixture_package(bytes: &[u8]) -> Package {
+        Package {
+            id: "fixture".into(),
+            category: appearance_category(),
+            name: "Fixture".into(),
+            api: 1,
+            version: "1.0.0".into(),
+            release_tag: "v0.3.92".into(),
+            size: bytes.len(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            asset: "CodeCodex-plugin-fixture-1.0.0.js".into(),
+            relative_path: "CodeCodex-plugin-fixture-1.0.0.js".into(),
+            resources: Vec::new(),
+            kind: script_kind(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn verified_legacy_cache_migrates_without_download() {
+        let bytes = b"legacy verified script";
+        let p = fixture_package(bytes);
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(format!("{}-{}.js", p.id, p.sha256));
+        std::fs::write(&legacy, bytes).unwrap();
+        assert!(source_available(root.path(), &p));
+        assert!(!path(root.path(), &p).exists());
+        assert_eq!(read_asset(root.path(), &p).unwrap(), bytes);
+        assert_eq!(std::fs::read(path(root.path(), &p)).unwrap(), bytes);
+        assert!(legacy.exists());
+        std::fs::remove_file(path(root.path(), &p)).unwrap();
+        std::fs::write(&legacy, b"legacy damaged script!").unwrap();
+        assert!(!source_available(root.path(), &p));
+        assert!(read_asset(root.path(), &p).is_err());
+        assert!(!path(root.path(), &p).exists());
+    }
+    #[test]
+    fn categorized_cache_reuses_all_verified_old_directory_resources() {
+        let main = b"verified module";
+        let png = b"\x89PNG\r\n\x1a\nresource";
+        let mut p = fixture_package(main);
+        p.category = "file-preview".into();
+        p.resources.push(Resource {
+            release_tag: String::new(),
+            asset: "CodeCodex-plugin-fixture-image.png".into(),
+            relative_path: "media/CodeCodex-plugin-fixture-image.png".into(),
+            kind: "image".into(),
+            mime_type: String::new(),
+            image: Some(json!({"name":"Default"})),
+            size: png.len(),
+            sha256: format!("{:x}", Sha256::digest(png)),
+        });
+        assert!(valid_package(&p));
+        let root = tempfile::tempdir().unwrap();
+        for asset in p.assets() {
+            let old = old_directory_path(root.path(), &asset);
+            verify_parents(root.path(), &old, true).unwrap();
+            let bytes = if asset.kind == "script" {
+                &main[..]
+            } else {
+                &png[..]
+            };
+            std::fs::write(&old, bytes).unwrap();
+            assert!(source_available(root.path(), &asset));
+            assert_eq!(read_asset(root.path(), &asset).unwrap(), bytes);
+            assert!(old.exists());
+            assert!(
+                path(root.path(), &asset)
+                    .starts_with(root.path().join("plugins/file-preview/fixture/1.0.0"))
+            );
+            assert_eq!(std::fs::read(path(root.path(), &asset)).unwrap(), bytes);
+        }
+    }
+    fn descriptor(id: &str, dependencies: Vec<&str>) -> Value {
+        json!({"id":id,"category":"file-preview","name":id,"api":1,"version":"1.0.0",
+            "releaseTag":"v0.3.96","size":1,"sha256":"a".repeat(64),
+            "asset":format!("CodeCodex-plugin-{id}-1.0.0.js"),"relativePath":format!("CodeCodex-plugin-{id}-1.0.0.js"),"dependencies":dependencies})
+    }
+    #[test]
+    fn trusted_catalog_rejects_bad_categories_paths_and_dependency_graphs() {
+        let good = descriptor("preview", vec![]);
+        assert!(parse_catalog(&json!([good]).to_string()).is_ok());
+        for key in ["category", "relativePath", "releaseTag"] {
+            let mut invalid = descriptor("preview", vec![]);
+            invalid[key] = json!("../outside");
+            assert!(parse_catalog(&json!([invalid]).to_string()).is_err());
+        }
+        for invalid in [
+            json!([descriptor("preview", vec!["missing"])]),
+            json!([descriptor("preview", vec!["preview"])]),
+            json!([
+                descriptor("first", vec!["second"]),
+                descriptor("second", vec!["first"])
+            ]),
+            json!([
+                descriptor("first", vec!["second", "second"]),
+                descriptor("second", vec![])
+            ]),
+            json!([descriptor("same", vec![]), descriptor("same", vec![])]),
+        ] {
+            assert!(parse_catalog(&invalid.to_string()).is_err());
+        }
+        let packages = parse_catalog(
+            &json!([
+                descriptor("first", vec!["second"]),
+                descriptor("second", vec![])
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            dependency_order(&packages, "first")
+                .unwrap()
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"]
+        );
+    }
+    #[test]
+    fn worker_and_wasm_resources_are_verified_data_not_main_context_scripts() {
+        let main = b"window.mainReady=true;";
+        let worker = b"self.postMessage('worker only');";
+        let wasm = b"\0asm\x01\0\0\0";
+        let mut p = fixture_package(main);
+        p.category = "file-preview".into();
+        for (kind, name, bytes) in [
+            ("worker", "worker.js", &worker[..]),
+            ("wasm", "module.wasm", &wasm[..]),
+        ] {
+            p.resources.push(Resource {
+            release_tag: String::new(),
+                asset: format!("CodeCodex-plugin-fixture-{name}"),
+                relative_path: format!("resources/CodeCodex-plugin-fixture-{name}"),
+                kind: kind.into(),
+                mime_type: String::new(),
+                image: None,
+                size: bytes.len(),
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            });
+        }
+        assert!(valid_package(&p));
+        let root = tempfile::tempdir().unwrap();
+        for asset in p.assets() {
+            let bytes = match asset.kind.as_str() {
+                "worker" => &worker[..],
+                "wasm" => &wasm[..],
+                _ => &main[..],
+            };
+            commit(
+                root.path(),
+                &asset,
+                bytes,
+                tempfile::NamedTempFile::new_in(root.path()).unwrap(),
+            )
+            .unwrap();
+        }
+        let sources = sources_for(root.path(), &p).unwrap();
+        assert_eq!(sources.len(), 4);
+        assert!(sources[0].contains("plugin-resources:v1"));
+        assert!(sources[0].contains("Uint8Array"));
+        assert!(!sources[0].contains("self.postMessage"));
+        assert!(sources[1].contains("application/wasm"));
+        assert_eq!(sources[2].as_bytes(), main);
+        assert!(sources[3].contains("verified-plugin-modules:v1"));
+        assert!(sources[3].contains(&p.sha256));
+        for resource in &p.resources {
+            assert!(sources[3].contains(&resource.sha256));
+        }
+        assert!(sources[3].contains("JSON.stringify([1,\"1.0.0\""));
+        let wasm_asset = p.assets().into_iter().find(|p| p.kind == "wasm").unwrap();
+        assert!(verify(&wasm_asset, b"not wasm").is_err());
+        std::fs::write(path(root.path(), &wasm_asset), b"damaged").unwrap();
+        assert!(sources_for(root.path(), &p).is_err());
+    }
+    #[test]
+    fn raw_binary_registration_stays_within_script_channel_after_base64_expansion() {
+        let bytes = vec![b'x'; MAX_SCRIPT];
+        let p = fixture_package(b"main");
+        let r = Resource {
+            release_tag: String::new(),
+            asset: "CodeCodex-plugin-fixture-buffer.bin".into(),
+            relative_path: "resources/CodeCodex-plugin-fixture-buffer.bin".into(),
+            kind: "binary".into(),
+            mime_type: "application/octet-stream".into(),
+            image: None,
+            size: bytes.len(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+        let sources = resource_sources(&p, &r, &bytes);
+        assert_eq!(sources.len(), 4);
+        assert!(sources.iter().all(|source| source.len() < MAX_SCRIPT));
+        assert!(sources[0].contains("new Uint8Array(4194304)"));
+        assert!(sources[3].contains(",3145728)"));
+    }
+    #[test]
+    fn raw_media_is_verified_before_bounded_registration_and_main() {
+        let png = b"\x89PNG\r\n\x1a\nfixture";
+        let main = b"/*main last*/";
+        let mut p = fixture_package(main);
+        p.gallery_version = 1;
+        p.default_image_count = 1;
+        for (kind, asset) in [("thumbnail", "thumb.png"), ("image", "image.png")] {
+            p.resources.push(Resource {
+            release_tag: String::new(),
+                asset: asset.into(),
+                relative_path: format!("media/{asset}"),
+                kind: kind.into(),
+                size: png.len(),
+                sha256: format!("{:x}", Sha256::digest(png)),
+                mime_type: String::new(),
+                image: (kind == "image")
+                    .then(|| json!({"name":"Original","thumbnailAsset":"thumb.png"})),
+            });
+        }
+        let root = tempfile::tempdir().unwrap();
+        for asset in p.assets() {
+            let bytes = if asset.kind == "script" {
+                &main[..]
+            } else {
+                &png[..]
+            };
+            commit(
+                root.path(),
+                &asset,
+                bytes,
+                tempfile::NamedTempFile::new_in(root.path()).unwrap(),
+            )
+            .unwrap();
+        }
+        let sources = sources_for(root.path(), &p).unwrap();
+        assert_eq!(sources.len(), 3);
+        assert!(sources[0].contains("default-galleries:v1"));
+        assert!(sources[0].contains("\"thumbnail\""));
+        assert!(!sources[0].contains("thumbnailAsset"));
+        assert!(sources[0].len() < MAX_SCRIPT);
+        assert_eq!(sources[1].as_bytes(), main);
+        assert!(sources[2].contains("verified-plugin-modules:v1"));
+        std::fs::write(path(root.path(), &p.assets()[0]), b"corrupted").unwrap();
+        assert!(sources_for(root.path(), &p).is_err());
+    }
+    #[test]
+    fn directory_boundaries_and_non_directory_parents_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(verify_parents(root.path(), &root.path().join("../escape.js"), true).is_err());
+        std::fs::write(root.path().join("plugins"), b"not a directory").unwrap();
+        let p = fixture_package(b"script");
+        assert!(read_asset(root.path(), &p).is_err());
+        assert!(
+            commit(
+                root.path(),
+                &p,
+                b"script",
+                tempfile::NamedTempFile::new_in(root.path()).unwrap()
+            )
+            .is_err()
+        );
+    }
+    async fn http_fixture(bytes: Vec<u8>, release_tail: Option<std::sync::mpsc::Receiver<()>>) -> reqwest::Response {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut client, _) = server.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = client.read(&mut request);
+            write!(
+                client,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .unwrap();
+            if let Some(release) = release_tail {
+                let _ = client.write_all(&bytes[..1]);
+                // Keep the response incomplete until the cancellation test drops
+                // its sender. A fixed delay can expire before send() is observed.
+                let _ = release.recv();
+                let _ = client.write_all(&bytes[1..]);
+            } else {
+                let _ = client.write_all(&bytes);
+            }
+        });
+        reqwest::Client::new()
+            .get(format!("http://{address}/fixture"))
+            .send()
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn http_body_is_verified_before_atomic_commit() {
+        let bytes = b"first party module";
+        let p = fixture_package(bytes);
+        let root = tempfile::tempdir().unwrap();
+        let response = http_fixture(bytes.to_vec(), None).await;
+        receive(&p, response, root.path()).await.unwrap();
+        assert_eq!(std::fs::read(test_path(root.path(), &p)).unwrap(), bytes);
+    }
+    #[tokio::test]
+    async fn corrupt_and_oversized_streams_leave_no_package() {
+        let p = fixture_package(b"expected script");
+        for bytes in [b"tampered script".to_vec(), vec![b'x'; p.size + 100]] {
+            let root = tempfile::tempdir().unwrap();
+            assert!(
+                receive(&p, http_fixture(bytes, None).await, root.path())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+    #[tokio::test]
+    async fn cancelling_a_stream_removes_its_staging_file() {
+        let bytes = vec![b'x'; 1024];
+        let p = fixture_package(&bytes);
+        let root = tempfile::tempdir().unwrap();
+        let (release, gate) = std::sync::mpsc::channel();
+        let response = http_fixture(bytes, Some(gate)).await;
+        tokio::select! {_ = tokio::time::sleep(Duration::from_millis(10))=>{},result=receive(&p,response,root.path())=>panic!("stream should still be pending: {result:?}")};
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        drop(release);
+    }
+    #[test]
+    fn damaged_cache_is_repaired_only_after_new_bytes_verify() {
+        let bytes = b"good script";
+        let p = fixture_package(bytes);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(test_path(root.path(), &p), b"bad").unwrap();
+        commit(
+            root.path(),
+            &p,
+            bytes,
+            tempfile::NamedTempFile::new_in(root.path()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(test_path(root.path(), &p)).unwrap(), bytes);
+    }
+}
+
+fn cache_io(phase: &str, error: &std::io::Error) -> BridgeError {
+    crate::runtime_log::record(
+        "plugin-cache",
+        phase,
+        "failed",
+        json!({"code":"PLUGIN_CACHE","ioKind":format!("{:?}",error.kind()),"osErrorCode":error.raw_os_error(),"errorChain":crate::network_diagnostics::error_details(error)["errorChain"]}),
+    );
+    BridgeError::new(
+        "PLUGIN_CACHE",
+        format!(
+            "{phase}: {}",
+            crate::network_diagnostics::error_message(error)
+        ),
+    )
+}

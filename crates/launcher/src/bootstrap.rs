@@ -1,0 +1,268 @@
+use std::path::{Path, PathBuf};
+
+use cdp_client::CapabilityToken;
+#[cfg(test)]
+use cdp_client::{PRIMARY_BINDING_NAME, PRIMARY_RECEIVER_NAME};
+use serde::Serialize;
+use thiserror::Error;
+
+const MAX_UI_BUNDLE_BYTES: u64 = 16 * 1024 * 1024;
+const EMBEDDED_UI_BUNDLE: &str = include_str!("../../../packages/explorer-ui/dist/explorer.js");
+
+#[derive(Debug, Clone, Error)]
+pub enum BootstrapError {
+    #[error("{operation}: {error}; {detail}")]
+    Context {
+        operation: &'static str,
+        detail: String,
+        #[source]
+        error: Box<BootstrapError>,
+    },
+    #[error("the Explorer UI bundle was not found")]
+    BundleNotFound,
+    #[error("the Explorer UI bundle is invalid")]
+    InvalidBundle,
+}
+
+impl BootstrapError {
+    pub fn context(self, operation: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self::Context {
+            operation,
+            detail: detail.to_string().chars().take(1024).collect(),
+            error: Box::new(self),
+        }
+    }
+    pub fn kind(&self) -> &Self {
+        match self {
+            Self::Context { error, .. } => error.kind(),
+            other => other,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapMetadata<'a> {
+    token: &'a str,
+    binding: &'a str,
+    receiver: &'a str,
+    codex_version: &'a str,
+    channel: &'a str,
+    compatible: bool,
+    manual_workspace: bool,
+    startup_splash_active: bool,
+    centralized_storage: bool,
+    language: workspace_service::ui_language::Preference,
+}
+
+#[derive(Debug, Clone)]
+pub enum BundleSource {
+    Embedded,
+    DevelopmentOverride(PathBuf),
+}
+
+pub fn resolve_bundle(explicit: Option<&Path>) -> Result<BundleSource, BootstrapError> {
+    if let Some(explicit) = explicit {
+        return validate_bundle_path(explicit).map(BundleSource::DevelopmentOverride);
+    }
+    if EMBEDDED_UI_BUNDLE.is_empty() || EMBEDDED_UI_BUNDLE.len() as u64 > MAX_UI_BUNDLE_BYTES {
+        return Err(BootstrapError::InvalidBundle.context(
+            "validating UI bundle",
+            format!(
+                "maxBytes={MAX_UI_BUNDLE_BYTES}; expected nonempty regular file or embedded bundle"
+            ),
+        ));
+    }
+    Ok(BundleSource::Embedded)
+}
+
+fn validate_bundle_path(path: &Path) -> Result<PathBuf, BootstrapError> {
+    let canonical = dunce::canonicalize(path).map_err(|error| {
+        BootstrapError::BundleNotFound.context(
+            "resolving UI bundle path",
+            format!(
+                "ioKind={:?}; osCode={:?}",
+                error.kind(),
+                error.raw_os_error()
+            ),
+        )
+    })?;
+    let metadata = canonical.metadata().map_err(|error| {
+        BootstrapError::InvalidBundle.context(
+            "reading UI bundle metadata",
+            format!(
+                "ioKind={:?}; osCode={:?}",
+                error.kind(),
+                error.raw_os_error()
+            ),
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_UI_BUNDLE_BYTES {
+        return Err(BootstrapError::InvalidBundle.context(
+            "validating UI bundle",
+            format!(
+                "maxBytes={MAX_UI_BUNDLE_BYTES}; expected nonempty regular file or embedded bundle"
+            ),
+        ));
+    }
+    Ok(canonical)
+}
+
+pub fn build_bootstrap(
+    bundle_source: &BundleSource,
+    token: &CapabilityToken,
+    binding: &str,
+    receiver: &str,
+    codex_version: &str,
+    channel: &str,
+    compatible: bool,
+    manual_workspace: bool,
+    startup_splash_active: bool,
+) -> Result<String, BootstrapError> {
+    let development_bundle;
+    let bundle = match bundle_source {
+        BundleSource::Embedded => EMBEDDED_UI_BUNDLE,
+        BundleSource::DevelopmentOverride(path) => {
+            development_bundle = std::fs::read_to_string(path).map_err(|error| {
+                BootstrapError::InvalidBundle.context(
+                    "reading UTF-8 UI bundle",
+                    format!(
+                        "ioKind={:?}; osCode={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    ),
+                )
+            })?;
+            &development_bundle
+        }
+    };
+    if bundle.len() as u64 > MAX_UI_BUNDLE_BYTES {
+        return Err(BootstrapError::InvalidBundle.context(
+            "validating UI bundle",
+            format!(
+                "maxBytes={MAX_UI_BUNDLE_BYTES}; expected nonempty regular file or embedded bundle"
+            ),
+        ));
+    }
+    let metadata = BootstrapMetadata {
+        token: token.expose(),
+        binding,
+        receiver,
+        codex_version,
+        channel,
+        compatible,
+        manual_workspace,
+        startup_splash_active,
+        language: crate::gui_support::localization::preference(),
+        centralized_storage: workspace_service::application_paths::install_root()
+            .ok()
+            .flatten()
+            .is_some(),
+    };
+    let metadata = serde_json::to_string(&metadata).map_err(|error| {
+        BootstrapError::InvalidBundle.context("serializing bootstrap metadata", error)
+    })?;
+    Ok(format!(
+        "(()=>{{'use strict';if(window!==window.top||location.protocol!=='app:'||location.host!=='-'){{return;}}const bootstrap=Object.freeze({metadata});Object.defineProperty(window,'__CODE_CODEX_BOOTSTRAP__',{{value:bootstrap,writable:false,configurable:true,enumerable:false}});try{{\n{bundle}\n}}finally{{try{{delete window.__CODE_CODEX_BOOTSTRAP__;}}catch(_error){{}}}}if(bootstrap.startupSplashActive){{return Promise.race([Promise.resolve(window.__CODE_CODEX_STARTUP_VISUAL_READY__),new Promise(resolve=>setTimeout(()=>resolve(false),5000))]);}}}})();\n//# sourceURL=code-codex://explorer.js"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn embeds_metadata_without_leaking_token_via_debug() {
+        let directory = TempDir::new().expect("temp dir");
+        let bundle = directory.path().join("explorer.js");
+        fs::write(&bundle, "window.__bundleLoaded=true;").expect("bundle");
+        let token = CapabilityToken::generate();
+        let source = build_bootstrap(
+            &BundleSource::DevelopmentOverride(bundle),
+            &token,
+            PRIMARY_BINDING_NAME,
+            PRIMARY_RECEIVER_NAME,
+            "26.715.3651.0",
+            "beta",
+            true,
+            false,
+            false,
+        )
+        .expect("bootstrap");
+        assert!(source.contains(token.expose()));
+        assert!(source.contains("26.715.3651.0"));
+        assert!(source.contains("\"manualWorkspace\":false"));
+        assert!(source.contains("\"startupSplashActive\":false"));
+        assert!(source.contains("__CODE_CODEX_BOOTSTRAP__"));
+        assert!(source.contains("delete window.__CODE_CODEX_BOOTSTRAP__"));
+        let guard = source.find("window!==window.top").expect("top-frame guard");
+        let exposed_token = source.find(token.expose()).expect("token metadata");
+        assert!(guard < exposed_token);
+        assert!(source.contains("location.protocol!=='app:'"));
+        assert!(source.contains("location.host!=='-'"));
+        assert!(!format!("{token:?}").contains(token.expose()));
+    }
+
+    #[test]
+    fn rejects_empty_bundle() {
+        let directory = TempDir::new().expect("temp dir");
+        let bundle = directory.path().join("empty.js");
+        fs::write(&bundle, "").expect("empty bundle");
+        assert!(validate_bundle_path(&bundle).is_err());
+    }
+
+    #[test]
+    fn accepts_bundle_larger_than_legacy_limit() {
+        let directory = TempDir::new().expect("temp dir");
+        let bundle = directory.path().join("explorer.js");
+        fs::write(&bundle, vec![b'a'; 9 * 1024 * 1024]).expect("bundle");
+        assert!(validate_bundle_path(&bundle).is_ok());
+    }
+
+    #[test]
+    fn startup_splash_handoff_waits_for_renderer_visual() {
+        let directory = TempDir::new().expect("temp dir");
+        let bundle = directory.path().join("explorer.js");
+        fs::write(&bundle, "window.__bundleLoaded=true;").expect("bundle");
+        let source = build_bootstrap(
+            &BundleSource::DevelopmentOverride(bundle),
+            &CapabilityToken::generate(),
+            PRIMARY_BINDING_NAME,
+            PRIMARY_RECEIVER_NAME,
+            "26.715.3651.0",
+            "beta",
+            true,
+            false,
+            true,
+        )
+        .expect("bootstrap");
+        assert!(source.contains("\"startupSplashActive\":true"));
+        assert!(source.contains("Promise.resolve(window.__CODE_CODEX_STARTUP_VISUAL_READY__)"));
+        assert!(source.contains("Promise.race"));
+    }
+
+    #[test]
+    fn default_bundle_is_embedded_and_non_empty() {
+        let source = resolve_bundle(None).expect("embedded source");
+        assert!(matches!(source, BundleSource::Embedded));
+        let token = CapabilityToken::generate();
+        let bootstrap = build_bootstrap(
+            &source,
+            &token,
+            PRIMARY_BINDING_NAME,
+            PRIMARY_RECEIVER_NAME,
+            "26.715.3651.0",
+            "beta",
+            true,
+            true,
+            false,
+        )
+        .expect("embedded bootstrap");
+        assert!(bootstrap.len() > token.expose().len() + 1_000);
+        assert!(bootstrap.contains("\"manualWorkspace\":true"));
+    }
+}

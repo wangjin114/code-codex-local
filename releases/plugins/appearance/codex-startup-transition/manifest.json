@@ -1,0 +1,21 @@
+{
+  "id": "codex-startup-transition",
+  "name": "Codex Startup Transition",
+  "category": "appearance",
+  "api": 1,
+  "version": "1.1.26",
+  "releaseTag": "plugin-assets-2026-10-18",
+  "asset": "CodeCodex-plugin-codex-startup-transition-1.1.26.js",
+  "relativePath": "CodeCodex-plugin-codex-startup-transition-1.1.26.js",
+  "size": 38198,
+  "sha256": "0e9a4689d037e93fca94fcff6e981187a8bec80a9ddd511b459a52ca151e58e0",
+  "resources": [],
+  "capabilities": [
+    "startup",
+    "preview",
+    "video-storage"
+  ],
+  "networkDuringStartup": false,
+  "source": "https://github.com/Rice-dog/code-codex",
+  "notices": "THIRD_PARTY_NOTICES_EN.md"
+}

@@ -1,0 +1,6 @@
+// Public compatibility surface; implementations have domain owners.
+export { MAIN_PREVIEW_TAG, MAIN_PREVIEW_ACTIVATE_EVENT, MAIN_PREVIEW_CLOSE_EVENT, MAIN_PREVIEW_DRAFT_EVENT, MAIN_PREVIEW_SAVE_EVENT, MAIN_PREVIEW_RELOAD_EVENT, MARKDOWN_PREVIEWER_ID, IMAGE_PREVIEWER_ID, VIDEO_PREVIEWER_ID, PDF_PREVIEWER_ID, AUDIO_PREVIEWER_ID, OFFICE_PREVIEWER_ID, NOTEBOOK_PREVIEWER_ID, CSV_PREVIEWER_ID, DIAGRAM_PREVIEWER_ID, MODEL_PREVIEWER_ID, NOTEBOOK_PREVIEW_MIME, NATIVE_POWERPOINT_PREVIEW_MIME, POWERPOINT_FULL_FIDELITY_NOTICE, GLTF_JSON_PREVIEW_MIME, GLTF_BINARY_PREVIEW_MIME, MAX_GLTF_JSON_PREVIEW_BYTES, MAX_MODEL_PREVIEW_BYTES, MAX_MODEL_RESOURCE_BYTES, MAX_MODEL_TEXTURE_BYTES, MAX_MODEL_AGGREGATE_BYTES, MAX_MODEL_RESOURCE_COUNT } from "./core/preview/configuration";
+export { ModelPreviewSourceError, inspectModelPreviewSource } from "./features/preview/model-source";
+export { previewPackageId } from "./features/preview/view-state";
+export { CodeCodexMainPreviewElement, registerMainPreviewElement } from "./app/main-preview-element";
+export type * from './file-preview/contracts';

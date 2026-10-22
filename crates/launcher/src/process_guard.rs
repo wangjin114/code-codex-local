@@ -1,0 +1,3018 @@
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::process::Command as StdCommand;
+use std::process::Stdio;
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+use same_file::Handle as SameFileHandle;
+use serde::Deserialize;
+use thiserror::Error;
+#[cfg(windows)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command as TokioCommand;
+
+pub(crate) const ACTIVATION_OBSERVATION_UNAVAILABLE: &str = "Windows activation succeeded but the returned PID could not be observed";
+
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(windows)]
+use process_wrap::tokio::TokioCommandWrapper;
+use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use win32job::{ExtendedLimitInfo, Job};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
+
+#[derive(Debug, Clone, Error)]
+pub enum ProcessGuardError {
+    #[error("{operation}: {error}; {detail}")]
+    Context {
+        operation: &'static str,
+        detail: String,
+        #[source]
+        error: Box<ProcessGuardError>,
+    },
+    #[error("a random loopback debugging port could not be reserved")]
+    PortUnavailable,
+    #[error("the CDP listener process could not be verified")]
+    OwnershipUnknown,
+    #[error("the existing Codex process state could not be verified")]
+    ProcessInspectionUnknown,
+    #[error("the CDP listener is not owned by the launched Codex process")]
+    OwnershipMismatch,
+    #[error("the CDP listener is not owned by the verified official Codex executable")]
+    ExecutableMismatch,
+    #[error("process verification failed: {0}")]
+    Detailed(String),
+}
+
+impl ProcessGuardError {
+    pub fn context(self, operation: &'static str, detail: impl std::fmt::Display) -> Self {
+        Self::Context {
+            operation,
+            detail: detail.to_string().chars().take(2048).collect(),
+            error: Box::new(self),
+        }
+    }
+    pub fn kind(&self) -> &Self {
+        match self {
+            Self::Context { error, .. } => error.kind(),
+            other => other,
+        }
+    }
+}
+
+/// Owns a launched Codex process for the complete debug-enabled lifetime.
+///
+/// `kill_on_drop` is the final safety net for cancellation and unwinding. The
+/// normal cleanup path additionally terminates the Windows process tree so an
+/// Electron child cannot retain the debugging listener after the launcher
+/// exits.
+pub struct CodexChildGuard {
+    child: Box<dyn TokioChildWrapper>,
+    pid: u32,
+    #[cfg(windows)]
+    observed_job: Option<Arc<Job>>,
+}
+
+/// Owns either a directly spawned Codex process tree or the helper supervising
+/// an activated Windows package PID. Direct executables retain the existing
+/// Job Object behavior; packaged applications use the supported shell
+/// activation API and are terminated only after their new process identity is
+/// verified.
+pub enum CodexProcessGuard {
+    Child(CodexChildGuard),
+    #[cfg(windows)]
+    Package(Box<CodexPackageGuard>),
+    #[cfg(windows)]
+    Recovered(RecoveredProcess),
+}
+
+/// A verified successor is owned by its retained handle, never by package-wide
+/// termination or a PID which Windows could subsequently reuse.
+#[cfg(windows)]
+pub struct RecoveredProcess {
+    pid: u32,
+    handle: OwnedHandle,
+}
+
+#[cfg(windows)]
+impl RecoveredProcess {
+    fn stop(&self) {
+        if process_handle_exit_code(&self.handle).is_ok_and(|code| code.is_none()) {
+            let ok = unsafe { windows_sys::Win32::System::Threading::TerminateProcess(self.handle.as_raw_handle().cast(), 0) };
+            crate::process_diagnostics::observe("startup recovery", "successor cleanup", if ok != 0 {"requested"} else {"failed"}, serde_json::json!({"pid":self.pid,"retainedHandle":true,"packageWideTermination":false,"osCode":if ok==0 {io::Error::last_os_error().raw_os_error()} else {None}}));
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RecoveredProcess {
+    fn drop(&mut self) { self.stop(); }
+}
+
+#[cfg(windows)]
+pub struct CodexPackageGuard {
+    helper: tokio::process::Child,
+    control: Option<tokio::process::ChildStdin>,
+    pid: u32,
+    activation_handle: OwnedHandle,
+    armed: bool,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct PackageActivationResult {
+    h_result: i32,
+    process_id: u32,
+}
+
+/// Assigns the suspended child to a separately retained, queryable job before
+/// `process-wrap` assigns and resumes its own kill-on-close job. Windows 8 and
+/// newer support this nested-job arrangement. Future descendants inherit both
+/// jobs, so the retained job gives the supervisor an exact child-tree liveness
+/// signal without weakening the existing kill-on-drop safety net.
+#[cfg(windows)]
+#[derive(Debug)]
+struct ObservableJob {
+    job: Arc<Job>,
+}
+
+#[cfg(windows)]
+impl TokioCommandWrapper for ObservableJob {
+    fn post_spawn(
+        &mut self,
+        child: &mut tokio::process::Child,
+        _core: &TokioCommandWrap,
+    ) -> io::Result<()> {
+        let handle = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("spawned process has no process handle"))?;
+        self.job
+            .assign_process(handle as isize)
+            .map_err(io::Error::other)
+    }
+}
+
+impl CodexChildGuard {
+    pub fn spawn(command: TokioCommand) -> io::Result<Self> {
+        let mut command = TokioCommandWrap::from(command);
+        #[cfg(windows)]
+        let observed_job = {
+            let mut limits = ExtendedLimitInfo::new();
+            limits.limit_kill_on_job_close();
+            let job = Arc::new(Job::create_with_limit_info(&limits).map_err(io::Error::other)?);
+            // This wrapper must precede JobObject: JobObject suspends in
+            // pre_spawn, ObservableJob assigns in post_spawn, and JobObject
+            // then assigns its own job and resumes the process in wrap_child.
+            command.wrap(ObservableJob { job: job.clone() });
+            job
+        };
+        command.wrap(KillOnDrop);
+        #[cfg(windows)]
+        command.wrap(JobObject);
+        let child = command.spawn()?;
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("spawned process has no process ID"))?;
+        Ok(Self {
+            child,
+            pid,
+            #[cfg(windows)]
+            observed_job: Some(observed_job),
+        })
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub async fn terminate(&mut self) {
+        #[cfg(windows)]
+        drop(self.observed_job.take());
+        // Closing the retained kill-on-close job terminates the complete tree;
+        // the process-wrap job then reaps the bootstrap process and provides a
+        // second kill-on-drop safety net.
+        let cleanup = Box::into_pin(self.child.kill());
+        let _ = tokio::time::timeout(Duration::from_secs(5), cleanup).await;
+    }
+
+    /// Wait until every process in the owned Windows Job Object has exited.
+    pub async fn wait_for_exit(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            loop {
+                let job = self
+                    .observed_job
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("Codex job is no longer available"))?;
+                if job
+                    .query_process_id_list()
+                    .map_err(io::Error::other)?
+                    .is_empty()
+                {
+                    Box::into_pin(self.child.wait()).await?;
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Box::into_pin(self.child.wait()).await?;
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn has_exited(&mut self) -> bool {
+        #[cfg(windows)]
+        {
+            self.observed_job.as_ref().is_none_or(|job| {
+                job.query_process_id_list()
+                    .is_ok_and(|processes| processes.is_empty())
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            self.child.try_wait().ok().flatten().is_some()
+        }
+    }
+}
+
+impl CodexProcessGuard {
+    pub fn spawn(command: TokioCommand) -> io::Result<Self> {
+        CodexChildGuard::spawn(command).map(Self::Child)
+    }
+
+    /// Activate the official packaged Codex application and retain a helper
+    /// that observes the returned activation PID. The helper intentionally
+    /// starts unarmed: the caller must verify the returned PID and then call
+    /// [`Self::arm_package_termination`] before this guard may terminate the
+    /// package.
+    pub async fn activate_package(
+        package_full_name: String,
+        aumid: String,
+        arguments: Vec<String>,
+    ) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        {
+            let _ = (package_full_name, aumid, arguments);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows package activation is unavailable on this platform",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+            let powershell = trusted_powershell().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "trusted System32 PowerShell could not be located",
+                )
+            })?;
+            let activation_arguments = quote_windows_arguments(&arguments);
+            let mut command = TokioCommand::new(powershell);
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Sta",
+                    "-Command",
+                    PACKAGE_ACTIVATION_SCRIPT,
+                ])
+                .env("CLE_PACKAGE_AUMID", aumid)
+                .env("CLE_PACKAGE_FULL_NAME", package_full_name)
+                .env("CLE_PACKAGE_ARGUMENTS", activation_arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW);
+
+            let mut helper = command.spawn()?;
+            let stderr_reader = helper
+                .stderr
+                .take()
+                .map(crate::process_diagnostics::capture_helper_stderr);
+            let control = match helper.stdin.take() {
+                Some(control) => control,
+                None => {
+                    let _ = helper.kill().await;
+                    let _ = helper.wait().await;
+                    crate::process_diagnostics::finish_helper_capture(stderr_reader).await;
+                    return Err(io::Error::other(
+                        "package activation helper has no control pipe",
+                    ));
+                }
+            };
+            let output = match helper.stdout.take() {
+                Some(output) => output,
+                None => {
+                    stop_unarmed_package_helper(helper, Some(control), stderr_reader).await;
+                    return Err(io::Error::other(
+                        "package activation helper has no result pipe",
+                    ));
+                }
+            };
+            let result_line = match tokio::time::timeout(
+                ACTIVATION_TIMEOUT,
+                read_package_activation_line(output),
+            )
+            .await
+            {
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => {
+                    stop_unarmed_package_helper(helper, Some(control), stderr_reader).await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    stop_unarmed_package_helper(helper, Some(control), stderr_reader).await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "package activation helper did not report a result",
+                    ));
+                }
+            };
+            let activation: PackageActivationResult = match serde_json::from_slice(&result_line) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    stop_unarmed_package_helper(helper, Some(control), stderr_reader).await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid package activation result: {error}"),
+                    ));
+                }
+            };
+            if activation.h_result < 0 || activation.process_id == 0 {
+                stop_unarmed_package_helper(helper, Some(control), stderr_reader).await;
+                return Err(io::Error::other(format!(
+                    "package activation failed with HRESULT 0x{:08X} and PID {}",
+                    activation.h_result as u32, activation.process_id
+                )));
+            }
+
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, activation.process_id) };
+            if raw.is_null() {
+                let error = io::Error::last_os_error();
+                stop_unarmed_package_helper(helper, Some(control), stderr_reader).await;
+                return Err(io::Error::new(error.kind(),format!("{ACTIVATION_OBSERVATION_UNAVAILABLE}: pid={}; osCode={:?}; kind={:?}",activation.process_id,error.raw_os_error(),error.kind())));
+            }
+            let activation_handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+            Ok(Self::Package(Box::new(CodexPackageGuard {
+                helper,
+                control: Some(control),
+                pid: activation.process_id,
+                activation_handle,
+                armed: false,
+                stderr_reader,
+            })))
+        }
+    }
+
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        match self {
+            Self::Child(child) => child.pid(),
+            #[cfg(windows)]
+            Self::Package(package) => package.pid,
+            #[cfg(windows)]
+            Self::Recovered(process) => process.pid,
+        }
+    }
+
+    /// Permit package-wide termination after the caller has established that
+    /// activation created the expected new official Codex process.
+    pub async fn arm_package_termination(&mut self) -> io::Result<()> {
+        match self {
+            Self::Child(_) => Ok(()),
+            #[cfg(windows)]
+            Self::Recovered(_) => Ok(()),
+            #[cfg(windows)]
+            Self::Package(package) => {
+                if package.armed {
+                    return Ok(());
+                }
+                let control = package.control.as_mut().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "package activation helper control pipe is closed",
+                    )
+                })?;
+                control.write_all(b"arm\n").await?;
+                control.flush().await?;
+                package.armed = true;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn wait_for_exit(&mut self) -> io::Result<()> {
+        match self {
+            Self::Child(child) => child.wait_for_exit().await,
+            #[cfg(windows)]
+            Self::Recovered(process) => {
+                while process_handle_exit_code(&process.handle)?.is_none() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Ok(())
+            }
+            #[cfg(windows)]
+            Self::Package(package) => {
+                let mut helper_exit_observed=false;
+                loop {
+                    if process_handle_exit_code(&package.activation_handle)?.is_some() { return Ok(()); }
+                    if !helper_exit_observed {
+                        match package.helper.try_wait() {
+                            Ok(Some(status)) => { helper_exit_observed=true;crate::runtime_log::record("startup","package helper exit","observed",serde_json::json!({"helperExitCode":status.code(),"activationPid":package.pid,"activationStillRunning":true,"waitingForRetainedActivationHandle":true})); }
+                            Err(error) => {helper_exit_observed=true;crate::runtime_log::record("startup","package helper exit","unavailable",serde_json::json!({"ioKind":format!("{:?}",error.kind()),"osCode":error.raw_os_error()}));}
+                            _=>{}
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+        }
+    }
+
+    pub fn exit_code(&mut self) -> io::Result<Option<u32>> {
+        match self {
+            Self::Child(child) => Ok(child.child.try_wait()?.and_then(|s| s.code()).map(|c| c as u32)),
+            #[cfg(windows)]
+            Self::Package(package) => process_handle_exit_code(&package.activation_handle),
+            #[cfg(windows)]
+            Self::Recovered(process) => process_handle_exit_code(&process.handle),
+        }
+    }
+
+    pub async fn terminate(&mut self) {
+        match self {
+            Self::Child(child) => child.terminate().await,
+            #[cfg(windows)]
+            Self::Package(package) => package.terminate().await,
+            #[cfg(windows)]
+            Self::Recovered(process) => process.stop(),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_verified_successor(pid: u32, handle: OwnedHandle) -> Self {
+        Self::Recovered(RecoveredProcess { pid, handle })
+    }
+}
+
+/// A read-only snapshot of the process returned by package activation/spawn.
+/// The handle is opened only for synchronization, so diagnostics do not need
+/// access to the process command line or private filesystem paths.
+pub fn launched_process_state(pid: u32) -> String {
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        "unavailable on this platform".to_owned()
+    }
+    #[cfg(windows)]
+    {
+        let raw_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw_handle.is_null() {
+            let error = io::Error::last_os_error();
+            return format!("could not inspect PID {pid}: {error}");
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw_handle.cast()) };
+        match unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) } {
+            WAIT_TIMEOUT => format!("PID {pid} is still running"),
+            WAIT_OBJECT_0 => format!("PID {pid} has exited"),
+            WAIT_FAILED => format!(
+                "could not inspect PID {pid}: {}",
+                io::Error::last_os_error()
+            ),
+            status => format!("PID {pid} returned unexpected wait status {status}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn process_handle_exit_code(handle: &OwnedHandle) -> io::Result<Option<u32>> {
+    match unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) } {
+        WAIT_TIMEOUT => Ok(None),
+        WAIT_OBJECT_0 => {
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(handle.as_raw_handle().cast(), &mut code) } == 0 { return Err(io::Error::last_os_error()); }
+            Ok(Some(code))
+        }
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(all(test,windows))]
+mod activation_wait_tests {
+    use super::*;
+    #[tokio::test]
+    async fn retained_activation_exit_does_not_wait_for_a_blocked_helper() {
+        let powershell=trusted_powershell().expect("PowerShell");
+        let mut target=TokioCommand::new(&powershell).args(["-NoProfile","-NonInteractive","-Command","Start-Sleep -Milliseconds 900; exit 0"]).creation_flags(0x0800_0000).spawn().expect("target");
+        let pid=target.id().unwrap();
+        let raw=unsafe{OpenProcess(PROCESS_SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,0,pid)};assert!(!raw.is_null());
+        let handle=unsafe{OwnedHandle::from_raw_handle(raw.cast())};
+        let mut helper=TokioCommand::new(&powershell).args(["-NoProfile","-NonInteractive","-Command","[Console]::In.ReadLine() | Out-Null"]).creation_flags(0x0800_0000).stdin(Stdio::piped()).stdout(Stdio::null()).spawn().expect("helper");
+        let control=helper.stdin.take();
+        let mut guard=CodexProcessGuard::Package(Box::new(CodexPackageGuard{helper,control,pid,activation_handle:handle,armed:false,stderr_reader:None}));
+        tokio::time::timeout(Duration::from_secs(8),guard.wait_for_exit()).await.expect("must observe original exit independently").unwrap();
+        assert_eq!(guard.exit_code().unwrap(),Some(0));
+        if let CodexProcessGuard::Package(p)=&mut guard{assert!(p.helper.try_wait().unwrap().is_none());}
+        guard.terminate().await;target.wait().await.unwrap();
+    }
+    #[tokio::test]
+    async fn clr_control_reader_is_nonblocking_with_an_open_stdin_pipe() {
+        let csharp=PACKAGE_ACTIVATION_SCRIPT.split("$source = @'\n").nth(1).unwrap().split("\n'@").next().unwrap();
+        let command=format!("$code=@'\n{csharp}\n'@\nAdd-Type -TypeDefinition $code; $pending=[CodexLiveExplorerPackageGuard.ControlInput]::BeginRead(); [Console]::Out.WriteLine('monitor-live'); [Console]::Out.Flush(); Start-Sleep -Milliseconds 500; [Console]::Out.WriteLine('monitor-finished')");
+        let mut helper=TokioCommand::new(trusted_powershell().unwrap()).args(["-NoProfile","-NonInteractive","-Command",&command]).creation_flags(0x0800_0000).stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let mut output=BufReader::new(helper.stdout.take().unwrap());let mut line=String::new();
+        tokio::time::timeout(Duration::from_secs(10),output.read_line(&mut line)).await.expect("open stdin must not block monitor").unwrap();assert_eq!(line.trim(),"monitor-live");
+        line.clear();tokio::time::timeout(Duration::from_secs(3),output.read_line(&mut line)).await.unwrap().unwrap();assert_eq!(line.trim(),"monitor-finished");
+        tokio::time::timeout(Duration::from_secs(3),helper.wait()).await.unwrap().unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod attached_lifetime_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn observer_waits_for_real_exit_without_terminating_or_following_pid() {
+        let powershell = trusted_powershell().expect("PowerShell");
+        let mut child = TokioCommand::new(&powershell)
+            .args(["-NoProfile","-NonInteractive","-Command","Start-Sleep -Seconds 2; exit 23"])
+            .creation_flags(0x0800_0000).spawn().expect("test child");
+        let pid = child.id().unwrap();
+        let handle = retain_native_identity(pid, UNIX_EPOCH, &powershell, None).expect("retain exact image");
+        let observer = AttachedProcess { pid, created_at: UNIX_EPOCH, handle };
+        assert!(observer.running().is_ok());
+        let code = tokio::time::timeout(Duration::from_secs(12),observer.wait_for_exit()).await.expect("bounded real wait").unwrap();
+        assert_eq!(code,23);
+        assert!(observer.running().is_err());
+        child.wait().await.unwrap();
+        drop(observer);
+
+        let mut child = TokioCommand::new(&powershell)
+            .args(["-NoProfile","-NonInteractive","-Command","Start-Sleep -Seconds 30"])
+            .creation_flags(0x0800_0000).kill_on_drop(true).spawn().expect("second child");
+        let pid = child.id().unwrap();
+        assert!(retain_native_identity(pid,UNIX_EPOCH,&powershell,Some(0)).is_err(),"changed generation rejected");
+        let handle = retain_native_identity(pid,UNIX_EPOCH,&powershell,None).unwrap();
+        drop(AttachedProcess{pid,created_at:UNIX_EPOCH,handle});
+        assert!(child.try_wait().unwrap().is_none(),"dropping observer must leave official process alive");
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[test]
+    fn observer_is_bound_to_verified_listener_and_generation() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST,0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let image = std::env::current_exe().unwrap();
+        let observer = AttachedProcess::for_listener(port,&image).expect("real verified listener");
+        assert_eq!(observer.pid(),std::process::id());
+        observer.verify_listener(port).unwrap();
+        drop(listener);
+        assert!(observer.verify_listener(port).is_err(),"closed/reassigned endpoint must not be trusted");
+        assert!(observer.running().is_ok());
+    }
+}
+
+#[cfg(windows)]
+impl CodexPackageGuard {
+    async fn terminate(&mut self) {
+        if let Some(mut control) = self.control.take() {
+            let message = if process_handle_exit_code(&self.activation_handle).ok().flatten().is_some() { b"release\n".as_slice() } else { b"terminate\n".as_slice() };
+            let _ = control.write_all(message).await;
+            let _ = control.flush().await;
+            let _ = control.shutdown().await;
+        }
+        if tokio::time::timeout(Duration::from_secs(5), self.helper.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.helper.kill().await;
+            let _ = self.helper.wait().await;
+        }
+        crate::process_diagnostics::finish_helper_capture(self.stderr_reader.take()).await;
+    }
+}
+
+#[cfg(windows)]
+async fn stop_unarmed_package_helper(
+    mut helper: tokio::process::Child,
+    control: Option<tokio::process::ChildStdin>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
+) {
+    drop(control);
+    if tokio::time::timeout(Duration::from_secs(2), helper.wait())
+        .await
+        .is_err()
+    {
+        let _ = helper.kill().await;
+        let _ = helper.wait().await;
+    }
+    crate::process_diagnostics::finish_helper_capture(stderr_reader).await;
+}
+
+#[cfg(windows)]
+async fn read_package_activation_line(output: tokio::process::ChildStdout) -> io::Result<Vec<u8>> {
+    const MAX_ACTIVATION_RESULT_BYTES: usize = 1_024;
+
+    let mut output = BufReader::new(output);
+    let mut line = Vec::new();
+    loop {
+        let (chunk, newline) = {
+            let available = output.fill_buf().await?;
+            if available.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "package activation helper closed its result pipe",
+                ));
+            }
+            if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
+                (available[..position].to_vec(), true)
+            } else {
+                (available.to_vec(), false)
+            }
+        };
+        let consumed = chunk.len() + usize::from(newline);
+        if line.len().saturating_add(chunk.len()) > MAX_ACTIVATION_RESULT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "package activation helper result exceeded the size limit",
+            ));
+        }
+        line.extend_from_slice(&chunk);
+        output.consume(consumed);
+        if newline {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return Ok(line);
+        }
+    }
+}
+
+#[cfg(windows)]
+const PACKAGE_ACTIVATION_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+function Write-CCActivation([string]$phase, [string]$outcome, $fields) {
+    $item=[ordered]@{phase=$phase;outcome=$outcome}
+    foreach($key in $fields.Keys){$item[$key]=$fields[$key]}
+    [Console]::Error.WriteLine('CC_PROCESS_QUERY='+(ConvertTo-Json -InputObject $item -Compress -Depth 4))
+}
+$activationStep='compile package activation helper'
+$source = @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+namespace CodexLiveExplorerPackageGuard
+{
+    public static class ControlInput
+    {
+        // Console.In.ReadLineAsync can block synchronously on .NET Framework.
+        // Run the actual read on a CLR thread, never a PowerShell scriptblock.
+        public static System.Threading.Tasks.Task<string> BeginRead()
+        {
+            return System.Threading.Tasks.Task.Factory.StartNew(
+                () => Console.In.ReadLine(), System.Threading.CancellationToken.None,
+                System.Threading.Tasks.TaskCreationOptions.LongRunning,
+                System.Threading.Tasks.TaskScheduler.Default);
+        }
+    }
+    [Flags]
+    public enum ActivateOptions : uint
+    {
+        None = 0,
+        DesignMode = 1,
+        NoErrorUI = 2,
+        NoSplashScreen = 4
+    }
+
+    public enum PackageExecutionState : int
+    {
+        Unknown = 0,
+        Running = 1,
+        Suspending = 2,
+        Suspended = 3,
+        Terminated = 4
+    }
+
+    [ComImport]
+    [Guid("1BB12A62-2AD8-432B-8CCF-0C2C52AFCD5B")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPackageExecutionStateChangeNotification
+    {
+        [PreserveSig]
+        int OnStateChanged(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName,
+            PackageExecutionState newState);
+    }
+
+    [ComImport]
+    [Guid("2E941141-7F97-4756-BA1D-9DECDE894A3D")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IApplicationActivationManager
+    {
+        [PreserveSig]
+        int ActivateApplication(
+            [MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+            [MarshalAs(UnmanagedType.LPWStr)] string arguments,
+            ActivateOptions options,
+            out uint processId);
+
+        [PreserveSig]
+        int ActivateForFile(
+            [MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+            IntPtr itemArray,
+            [MarshalAs(UnmanagedType.LPWStr)] string verb,
+            out uint processId);
+
+        [PreserveSig]
+        int ActivateForProtocol(
+            [MarshalAs(UnmanagedType.LPWStr)] string appUserModelId,
+            IntPtr itemArray,
+            out uint processId);
+    }
+
+    [ComImport]
+    [Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
+    public class ApplicationActivationManager
+    {
+    }
+
+    // Method order and signatures mirror the complete IPackageDebugSettings
+    // vtable in ShObjIdl_core.h. In particular, TerminateAllProcesses is slot
+    // 5 and GetPackageExecutionState is slot 13 after IUnknown.
+    [ComImport]
+    [Guid("F27C3930-8029-4AD1-94E3-3DBA417810C1")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    public interface IPackageDebugSettings
+    {
+        [PreserveSig]
+        int EnableDebugging(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName,
+            [MarshalAs(UnmanagedType.LPWStr)] string debuggerCommandLine,
+            IntPtr environment);
+
+        [PreserveSig]
+        int DisableDebugging(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName);
+
+        [PreserveSig]
+        int Suspend(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName);
+
+        [PreserveSig]
+        int Resume(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName);
+
+        [PreserveSig]
+        int TerminateAllProcesses(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName);
+
+        [PreserveSig]
+        int SetTargetSessionId(uint sessionId);
+
+        [PreserveSig]
+        int EnumerateBackgroundTasks(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName,
+            out uint taskCount,
+            out IntPtr taskIds,
+            out IntPtr taskNames);
+
+        [PreserveSig]
+        int ActivateBackgroundTask(ref Guid taskId);
+
+        [PreserveSig]
+        int StartServicing(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName);
+
+        [PreserveSig]
+        int StopServicing(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName);
+
+        [PreserveSig]
+        int StartSessionRedirection(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName,
+            uint sessionId);
+
+        [PreserveSig]
+        int StopSessionRedirection(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName);
+
+        [PreserveSig]
+        int GetPackageExecutionState(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName,
+            out PackageExecutionState packageExecutionState);
+
+        [PreserveSig]
+        int RegisterForPackageStateChanges(
+            [MarshalAs(UnmanagedType.LPWStr)] string packageFullName,
+            IPackageExecutionStateChangeNotification packageExecutionStateChangeNotification,
+            out uint cookie);
+
+        [PreserveSig]
+        int UnregisterForPackageStateChanges(uint cookie);
+    }
+
+    [ComImport]
+    [Guid("B1AEC16F-2383-4852-B0E9-8F0B1DC66B4D")]
+    public class PackageDebugSettings
+    {
+    }
+
+    public sealed class ActivationResult
+    {
+        public int HResult { get; set; }
+        public uint ProcessId { get; set; }
+    }
+
+    public static class Activator
+    {
+        public static ActivationResult Activate(string appUserModelId, string arguments)
+        {
+            IApplicationActivationManager manager = null;
+            uint processId = 0;
+            int hresult;
+            try
+            {
+                manager = (IApplicationActivationManager)new ApplicationActivationManager();
+                hresult = manager.ActivateApplication(
+                    appUserModelId,
+                    arguments,
+                    ActivateOptions.NoErrorUI,
+                    out processId);
+            }
+            catch (Exception error)
+            {
+                hresult = Marshal.GetHRForException(error);
+                processId = 0;
+            }
+            finally
+            {
+                if (manager != null && Marshal.IsComObject(manager))
+                {
+                    try
+                    {
+                        Marshal.FinalReleaseComObject(manager);
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            return new ActivationResult { HResult = hresult, ProcessId = processId };
+        }
+    }
+
+    public sealed class PackageController : IDisposable
+    {
+        private IPackageDebugSettings settings;
+
+        public PackageController()
+        {
+            settings = (IPackageDebugSettings)new PackageDebugSettings();
+        }
+
+        public int TerminateAllProcesses(string packageFullName)
+        {
+            return settings.TerminateAllProcesses(packageFullName);
+        }
+
+        public void Dispose()
+        {
+            if (settings != null && Marshal.IsComObject(settings))
+            {
+                Marshal.FinalReleaseComObject(settings);
+            }
+            settings = null;
+        }
+    }
+}
+'@
+
+$controller = $null
+$activatedProcess = $null
+$activationCompleted = $false
+$activationHResult = [int]0
+$activatedProcessId = [uint32]0
+try {
+    Write-CCActivation $activationStep 'started' @{}
+    Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+    Write-CCActivation $activationStep 'passed' @{}
+    $activationStep='create package controller'
+    $controller = New-Object CodexLiveExplorerPackageGuard.PackageController
+    $activationStep='activate official Windows package'
+    Write-CCActivation $activationStep 'started' @{}
+    $activation = [CodexLiveExplorerPackageGuard.Activator]::Activate(
+        $env:CLE_PACKAGE_AUMID,
+        $env:CLE_PACKAGE_ARGUMENTS)
+    $activationHResult = [int]$activation.HResult
+    $activatedProcessId = [uint32]$activation.ProcessId
+    $activationCompleted = $true
+    Write-CCActivation $activationStep 'returned' @{hresult=$activationHResult;pid=$activatedProcessId}
+    $activationStep='open activated process handle'
+    if ($activationHResult -ge 0 -and $activatedProcessId -ne 0) {
+        $activatedProcess = [Diagnostics.Process]::GetProcessById([int]$activatedProcessId)
+        $null = $activatedProcess.Handle
+    }
+}
+catch {
+    Write-CCActivation $activationStep 'failed' @{exceptionType=$_.Exception.GetType().FullName;message=$_.Exception.Message;hresult=$_.Exception.HResult;category=$_.CategoryInfo.Category.ToString();fullyQualifiedErrorId=$_.FullyQualifiedErrorId;scriptLine=$_.InvocationInfo.ScriptLineNumber}
+    if (-not $activationCompleted) {
+        $activationHResult = [Runtime.InteropServices.Marshal]::GetHRForException($_.Exception)
+        $activatedProcessId = [uint32]0
+    }
+    $activatedProcess = $null
+}
+
+$culture = [Globalization.CultureInfo]::InvariantCulture
+$resultJson = '{"HResult":' + $activationHResult.ToString($culture) +
+    ',"ProcessId":' + $activatedProcessId.ToString($culture) + '}'
+[Console]::Out.WriteLine($resultJson)
+[Console]::Out.Flush()
+
+if ($activationHResult -lt 0 -or $activatedProcessId -eq 0 -or
+    $null -eq $controller -or $null -eq $activatedProcess) {
+    if ($null -ne $controller) {
+        $controller.Dispose()
+    }
+    exit 1
+}
+
+$packageFullName = $env:CLE_PACKAGE_FULL_NAME
+$armed = $false
+$inputClosed = $false
+$terminateRequested = $false
+$terminationIssued = $false
+$terminationSucceeded = $false
+$processExited = $false
+$monitorFailed = $false
+$readTask = [CodexLiveExplorerPackageGuard.ControlInput]::BeginRead()
+
+try {
+    while ($true) {
+        if ($activatedProcess.HasExited) {
+            Write-CCActivation 'activation PID exit' 'observed' @{pid=$activatedProcessId;exitCode=$activatedProcess.ExitCode}
+            $processExited = $true
+            break
+        }
+        if (-not $inputClosed -and $readTask.IsCompleted) {
+            $line = $readTask.Result
+            if ($null -eq $line) {
+                $inputClosed = $true
+                if ($armed) {
+                    $terminateRequested = $true
+                }
+            }
+            else {
+                $controlMessage = $line.Trim().ToLowerInvariant()
+                if ($controlMessage -eq 'arm') {
+                    $armed = $true
+                    Write-CCActivation 'termination authorization' 'armed' @{pid=$activatedProcessId}
+                }
+                elseif ($controlMessage -eq 'terminate') {
+                    if ($armed) {
+                        $terminateRequested = $true
+                    }
+                    else {
+                        $inputClosed = $true
+                    }
+                }
+                elseif ($controlMessage -eq 'release') {
+                    $armed = $false
+                    $inputClosed = $true
+                }
+                else {
+                    $inputClosed = $true
+                    if ($armed) {
+                        $terminateRequested = $true
+                    }
+                }
+                if (-not $inputClosed) {
+                    $readTask = [CodexLiveExplorerPackageGuard.ControlInput]::BeginRead()
+                }
+            }
+        }
+
+        if ($inputClosed -and -not $armed) {
+            break
+        }
+
+        if ($terminateRequested -and -not $terminationIssued) {
+            if ($activatedProcess.HasExited) { $processExited = $true; break }
+            $terminationHResult = [int]$controller.TerminateAllProcesses($packageFullName)
+            Write-CCActivation 'TerminateAllProcesses' 'returned' @{hresult=$terminationHResult}
+            $terminationIssued = $true
+            $terminationSucceeded = $terminationHResult -ge 0
+            if (-not $terminationSucceeded) {
+                $monitorFailed = $true
+                break
+            }
+        }
+
+        if ($activatedProcess.HasExited) {
+            Write-CCActivation 'activation PID exit' 'observed' @{pid=$activatedProcessId;exitCode=$activatedProcess.ExitCode}
+            $processExited = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+}
+catch {
+    Write-CCActivation 'package supervision' 'failed' @{exceptionType=$_.Exception.GetType().FullName;message=$_.Exception.Message;hresult=$_.Exception.HResult;scriptLine=$_.InvocationInfo.ScriptLineNumber}
+    $monitorFailed = $true
+}
+finally {
+    if ($armed -and -not $processExited -and -not $terminationSucceeded) {
+        try {
+            $null = $controller.TerminateAllProcesses($packageFullName)
+        }
+        catch {
+        }
+    }
+    $activatedProcess.Dispose()
+    $controller.Dispose()
+}
+
+if ($monitorFailed) {
+    exit 2
+}
+exit 0
+"#;
+
+/// Quote one argument using the Windows C runtime/CommandLineToArgvW rules.
+/// This is deliberately shell-independent: the resulting command line is
+/// supplied directly to `ActivateApplication`.
+fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument
+            .chars()
+            .any(|character| character == '"' || character.is_whitespace())
+    {
+        return argument.to_owned();
+    }
+
+    let mut quoted = String::with_capacity(argument.len().saturating_add(2));
+    quoted.push('"');
+    let mut backslashes = 0usize;
+    for character in argument.chars() {
+        match character {
+            '\\' => backslashes = backslashes.saturating_add(1),
+            '"' => {
+                for _ in 0..backslashes.saturating_mul(2).saturating_add(1) {
+                    quoted.push('\\');
+                }
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    for _ in 0..backslashes.saturating_mul(2) {
+        quoted.push('\\');
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn quote_windows_arguments(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| quote_windows_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub struct PortReservation {
+    listener: TcpListener,
+}
+
+impl PortReservation {
+    pub fn reserve() -> Result<Self, ProcessGuardError> {
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .map_err(|error| {
+                ProcessGuardError::PortUnavailable.context("reserve", format!("cause={error}"))
+            })?;
+        Ok(Self { listener })
+    }
+
+    pub fn port(&self) -> Result<u16, ProcessGuardError> {
+        self.listener
+            .local_addr()
+            .map(|address| address.port())
+            .map_err(|error| {
+                ProcessGuardError::PortUnavailable.context("port", format!("cause={error}"))
+            })
+    }
+
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct OwnershipSnapshot {
+    #[serde(default)]
+    listeners: Vec<u32>,
+    #[serde(default)]
+    processes: Vec<ProcessRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ProcessRecord {
+    process_id: u32,
+    parent_process_id: u32,
+    creation_unix_millis: i64,
+    #[serde(default)]
+    executable_path: Option<String>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ProcessIdentitySnapshot {
+    process_id: u32,
+    creation_unix_millis: i64,
+    executable_path: String,
+    creation_matches: bool,
+    executable_matches: bool,
+}
+
+#[cfg(windows)]
+pub(crate) fn trusted_powershell() -> Option<PathBuf> {
+    trusted_system32_executable(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
+#[cfg(not(windows))]
+pub(crate) fn trusted_powershell() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn trusted_system32_executable(relative: &str) -> Option<PathBuf> {
+    let system_root = PathBuf::from(env::var_os("SystemRoot")?);
+    if !system_root.is_absolute() {
+        return None;
+    }
+    let system_root = dunce::canonicalize(system_root).ok()?;
+    let system32 = dunce::canonicalize(system_root.join("System32")).ok()?;
+    let executable = dunce::canonicalize(system32.join(relative)).ok()?;
+    if executable.is_file() && path_starts_with(&executable, &system32) {
+        Some(executable)
+    } else {
+        None
+    }
+}
+
+/// Verify that an activation PID belongs to a newly-created instance of the
+/// exact canonical official executable. All process inspection runs in the
+/// trusted System32 PowerShell, and all dynamic values are passed through its
+/// environment rather than interpolated into the program.
+pub fn verify_process_identity(
+    pid: u32,
+    launched_after: SystemTime,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    let result = verify_process_identity_inner(pid, launched_after, official_executable);
+    #[cfg(windows)]
+    let result = recover_identity_fields(result, pid, launched_after, official_executable);
+    crate::process_diagnostics::observe(
+        "process identity",
+        "Rust identity decision",
+        if result.is_ok() { "passed" } else { "failed" },
+        serde_json::json!({"port":Option::<u16>::None, "pid":Some(pid), "reason":result.as_ref().err().map(ToString::to_string), "securityChecksRequired":true}),
+    );
+    result
+}
+
+#[cfg(windows)]
+fn recover_identity_fields(
+    result: Result<(), ProcessGuardError>,
+    pid: u32,
+    launched_after: SystemTime,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    match result {
+        Err(ref error) if identity_fields_unavailable(error) => {
+            let original_detail = match error {
+                ProcessGuardError::Detailed(detail) => detail.as_str(),
+                _ => unreachable!(),
+            };
+            crate::process_diagnostics::observe(
+                "process identity",
+                "same PID native recovery",
+                "started",
+                serde_json::json!({"pid":pid,"originalError":error.to_string(),"securityChecksRequired":true,"adoptOtherPid":false}),
+            );
+            let native = verify_process_identity_native(pid, launched_after, official_executable);
+            crate::process_diagnostics::observe(
+                "process identity",
+                "same PID native recovery",
+                if native.is_ok() {
+                    "recovered"
+                } else {
+                    "failed"
+                },
+                serde_json::json!({"pid":pid,"originalError":error.to_string(),"nativeError":native.as_ref().err().map(ToString::to_string),"securityChecksRequired":true}),
+            );
+            native.map_err(|native_error| {
+                ProcessGuardError::Detailed(format!(
+                    "{original_detail}; same PID native recovery failed: {native_error}"
+                ))
+            })
+        }
+        other => other,
+    }
+}
+
+#[cfg(windows)]
+fn identity_fields_unavailable(error: &ProcessGuardError) -> bool {
+    matches!(error, ProcessGuardError::Detailed(message)
+        if message.starts_with("process identity query failed:")
+        && message.contains("last_phase=required activation fields;"))
+}
+
+#[cfg(all(test, windows))]
+mod activation_identity_tests {
+    use super::*;
+
+    #[test]
+    fn native_identity_requires_live_exact_image_and_new_creation_time() {
+        let image = std::env::current_exe().expect("image");
+        let pid = std::process::id();
+        verify_process_identity_native(pid, UNIX_EPOCH, &image).expect("exact identity");
+        assert!(
+            verify_process_identity_native(
+                pid,
+                SystemTime::now() + Duration::from_secs(60),
+                &image
+            )
+            .is_err()
+        );
+        assert!(
+            verify_process_identity_native(
+                pid,
+                UNIX_EPOCH,
+                &trusted_powershell().expect("different image")
+            )
+            .is_err()
+        );
+        assert!(verify_process_identity_native(0, UNIX_EPOCH, &image).is_err());
+        assert!(verify_process_identity_native(u32::MAX, UNIX_EPOCH, &image).is_err());
+    }
+
+    #[test]
+    fn recovery_is_limited_to_missing_cim_fields_and_preserves_first_error() {
+        let image = std::env::current_exe().expect("image");
+        let pid = std::process::id();
+        let missing = || {
+            ProcessGuardError::Detailed("process identity query failed: attempt=1; last_phase=required activation fields; error=process identity is unavailable".into())
+        };
+        recover_identity_fields(Err(missing()), pid, UNIX_EPOCH, &image)
+            .expect("verified recovery");
+        let rejected = recover_identity_fields(
+            Err(missing()),
+            pid,
+            UNIX_EPOCH,
+            &trusted_powershell().expect("image"),
+        )
+        .expect_err("mismatch")
+        .to_string();
+        assert!(rejected.contains("process identity is unavailable"));
+        assert!(rejected.contains("exact_image_match=false"));
+        for error in [
+            "activated executable mismatch",
+            "process identity response is invalid JSON",
+            "process identity query failed: last_phase=Get-CimInstance; category=PermissionDenied",
+        ] {
+            let rejected = recover_identity_fields(
+                Err(ProcessGuardError::Detailed(error.into())),
+                pid,
+                UNIX_EPOCH,
+                &image,
+            )
+            .expect_err("no fallback");
+            assert!(matches!(rejected, ProcessGuardError::Detailed(ref detail) if detail == error));
+        }
+    }
+
+    #[test]
+    fn real_powershell_field_errors_distinguish_absent_pid_and_missing_path() {
+        let pid = u32::MAX.to_string();
+        let image = std::env::current_exe().expect("image");
+        let inputs = [
+            ("CLE_CODEX_PID", std::ffi::OsStr::new(&pid)),
+            ("CLE_CODEX_LAUNCHED_AFTER_MILLIS", std::ffi::OsStr::new("0")),
+            ("CLE_CODEX_EXE", image.as_os_str()),
+        ];
+        let error = diagnostic_query(
+            "process identity",
+            PROCESS_IDENTITY_SCRIPT,
+            &inputs,
+            4096,
+            None,
+            Some(u32::MAX),
+        )
+        .expect_err("missing PID");
+        assert!(error.to_string().contains("activation PID not found"));
+        assert!(identity_fields_unavailable(&error));
+        let script = PROCESS_IDENTITY_SCRIPT.replace("$process=Invoke-CCStep 'Get-CimInstance Win32_Process (activation PID)' { Get-CimInstance Win32_Process -Filter ('ProcessId = '+$processId.ToString($culture)) }", "$process=[pscustomobject]@{ExecutablePath=$null}");
+        let error = diagnostic_query(
+            "process identity",
+            &script,
+            &inputs,
+            4096,
+            None,
+            Some(u32::MAX),
+        )
+        .expect_err("missing executable");
+        assert!(error.to_string().contains("executable path missing"));
+        recover_identity_fields(Err(error), std::process::id(), UNIX_EPOCH, &image)
+            .expect("native recovery after actual PowerShell error");
+    }
+}
+
+/// An independent identity check, never a name/WindowsApps-only fallback.
+/// A fresh handle binds image, creation time and liveness to the same process.
+#[cfg(windows)]
+pub(crate) fn verify_process_identity_native(
+    pid: u32,
+    launched_after: SystemTime,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    retain_native_identity(pid, launched_after, official_executable, None).map(drop)
+}
+
+#[cfg(windows)]
+fn retain_native_identity(
+    pid: u32,
+    launched_after: SystemTime,
+    official_executable: &Path,
+    expected_creation_ms: Option<i64>,
+) -> Result<OwnedHandle, ProcessGuardError> {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{
+            GetProcessTimes, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        },
+    };
+    let failed = |phase: &str| {
+        ProcessGuardError::Detailed(format!(
+            "native identity {phase} failed: pid={pid}; OS error {:?}",
+            io::Error::last_os_error().raw_os_error()
+        ))
+    };
+    if pid == 0 {
+        return Err(ProcessGuardError::Detailed(
+            "native identity rejected PID 0".into(),
+        ));
+    }
+    let activation = crate::process_diagnostics::native_process(pid);
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if raw.is_null() {
+        return Err(failed("OpenProcess"));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    let ensure_running = || match unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) } {
+        WAIT_TIMEOUT => Ok(()),
+        WAIT_OBJECT_0 => Err(ProcessGuardError::Detailed(format!(
+            "native identity rejected exited PID {pid}"
+        ))),
+        _ => Err(failed("WaitForSingleObject")),
+    };
+    ensure_running()?;
+    let mut buffer = vec![0u16; 32768];
+    let mut length = buffer.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(raw, 0, buffer.as_mut_ptr(), &mut length) } == 0 {
+        return Err(failed("QueryFullProcessImageNameW"));
+    }
+    let mut created: FILETIME = unsafe { std::mem::zeroed() };
+    let mut ended = created;
+    let mut kernel = created;
+    let mut user = created;
+    if unsafe { GetProcessTimes(raw, &mut created, &mut ended, &mut kernel, &mut user) } == 0 {
+        return Err(failed("GetProcessTimes"));
+    }
+    let ticks = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+    if activation["retainedActivationHandle"] == true
+        && (activation["state"] != "running"
+            || activation["creationFiletime"].as_u64() != Some(ticks))
+    {
+        return Err(ProcessGuardError::Detailed(format!(
+            "native identity rejected changed/exited activation generation: pid={pid}"
+        )));
+    }
+    let created_ms = ticks.checked_sub(116444736000000000).map(|n| n / 10000);
+    if expected_creation_ms.is_some_and(|expected| u64::try_from(expected).ok() != created_ms) {
+        return Err(ProcessGuardError::Detailed(format!(
+            "attached process generation changed before handle retention: pid={pid}"
+        )));
+    }
+    let launch_ms = launched_after
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|n| n.as_millis());
+    let time_matches =
+        matches!((created_ms,launch_ms), (Some(created),Some(launch)) if created as u128 >= launch);
+    let observed = dunce::canonicalize(PathBuf::from(String::from_utf16_lossy(
+        &buffer[..length as usize],
+    )))
+    .map_err(|e| {
+        ProcessGuardError::Detailed(format!(
+            "native observed image canonicalization failed: OS error {:?}",
+            e.raw_os_error()
+        ))
+    })?;
+    let official = dunce::canonicalize(official_executable).map_err(|e| {
+        ProcessGuardError::Detailed(format!(
+            "native official image canonicalization failed: OS error {:?}",
+            e.raw_os_error()
+        ))
+    })?;
+    let canonical_match = observed
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&official.to_string_lossy());
+    let same_file = match (
+        SameFileHandle::from_path(&observed),
+        SameFileHandle::from_path(&official),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let image_matches = observed.is_file() && official.is_file() && (canonical_match || same_file);
+    crate::process_diagnostics::observe(
+        "process identity",
+        "native exact identity",
+        "observed",
+        serde_json::json!({"pid":pid,"creationUnixMs":created_ms,"createdAfterLaunch":time_matches,"canonicalPathsMatch":canonical_match,"sameFile":same_file,"imageMatches":image_matches,"freshReadOnlyHandle":true}),
+    );
+    if !time_matches || !image_matches {
+        return Err(ProcessGuardError::Detailed(format!(
+            "native identity mismatch: pid={pid}; created_after_launch={time_matches}; exact_image_match={image_matches}"
+        )));
+    }
+    ensure_running()?;
+    Ok(handle)
+}
+
+fn verify_process_identity_inner(
+    pid: u32,
+    launched_after: SystemTime,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    #[cfg(not(windows))]
+    {
+        let _ = (pid, launched_after, official_executable);
+        Err(ProcessGuardError::OwnershipUnknown)
+    }
+    #[cfg(windows)]
+    {
+        const MAX_IDENTITY_OUTPUT_BYTES: usize = 4 * 1024;
+
+        if pid == 0 {
+            return Err(ProcessGuardError::Detailed(
+                "activation returned PID 0".into(),
+            ));
+        }
+        let official_executable = dunce::canonicalize(official_executable).map_err(|error| {
+            ProcessGuardError::Detailed(format!(
+                "official executable canonicalization failed: OS error {:?}",
+                error.raw_os_error()
+            ))
+        })?;
+        if !official_executable.is_file() {
+            return Err(ProcessGuardError::Detailed(
+                "canonical official executable is not a file".into(),
+            ));
+        }
+        let launched_after_millis: i64 = launched_after
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                ProcessGuardError::OwnershipUnknown
+                    .context("verify_process_identity_inner", format!("cause={error}"))
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|error| {
+                ProcessGuardError::OwnershipUnknown
+                    .context("verify_process_identity_inner", format!("cause={error}"))
+            })?;
+        let pid_input = pid.to_string();
+        let launch_input = launched_after_millis.to_string();
+        let output = diagnostic_query(
+            "process identity",
+            PROCESS_IDENTITY_SCRIPT,
+            &[
+                ("CLE_CODEX_PID", pid_input.as_ref()),
+                ("CLE_CODEX_LAUNCHED_AFTER_MILLIS", launch_input.as_ref()),
+                ("CLE_CODEX_EXE", official_executable.as_os_str()),
+            ],
+            MAX_IDENTITY_OUTPUT_BYTES,
+            None,
+            Some(pid),
+        )?;
+        let snapshot: ProcessIdentitySnapshot =
+            serde_json::from_slice(&output).map_err(|error| {
+                ProcessGuardError::Detailed(format!(
+                    "process identity response is invalid JSON: category={:?}, line={}, column={}",
+                    error.classify(),
+                    error.line(),
+                    error.column()
+                ))
+            })?;
+        if snapshot.process_id != pid
+            || snapshot.creation_unix_millis < launched_after_millis
+            || !snapshot.creation_matches
+        {
+            return Err(ProcessGuardError::Detailed(format!(
+                "activated PID or creation time mismatch: expected_pid={pid}, observed_pid={}, created_after_launch={}, CIM_creation_matches={}",
+                snapshot.process_id,
+                snapshot.creation_unix_millis >= launched_after_millis,
+                snapshot.creation_matches
+            )));
+        }
+        let observed_executable =
+            dunce::canonicalize(&snapshot.executable_path).map_err(|error| {
+                ProcessGuardError::Detailed(format!(
+                    "observed executable canonicalization failed: pid={pid}, observed_file={}, observed_package={}, OS error {:?}",
+                    safe_windowsapps_component(Path::new(&snapshot.executable_path), false),
+                    safe_windowsapps_component(Path::new(&snapshot.executable_path), true),
+                    error.raw_os_error(),
+                ))
+            })?;
+        let canonical_paths_match = observed_executable
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&official_executable.to_string_lossy());
+        let same_file = match (
+            SameFileHandle::from_path(&observed_executable),
+            SameFileHandle::from_path(&official_executable),
+        ) {
+            (Ok(observed), Ok(official)) => observed == official,
+            _ => false,
+        };
+        // CIM may use a different spelling of the same packaged image. Only
+        // accept canonical equality or an identical file handle, never merely
+        // another executable in WindowsApps or the same package directory.
+        if !observed_executable.is_file() || !(canonical_paths_match || same_file) {
+            return Err(ProcessGuardError::Detailed(format!(
+                "activated executable mismatch: pid={pid}, CIM_path_available={}, CIM_raw_match={}, observed_location={}, official_location={}, observed_file={}, official_file={}, observed_package={}, official_package={}, canonical_paths_match={canonical_paths_match}, same_file={same_file}",
+                !snapshot.executable_path.is_empty(),
+                snapshot.executable_matches,
+                path_location(&snapshot.executable_path),
+                path_location(&official_executable.to_string_lossy()),
+                safe_windowsapps_component(&observed_executable, false),
+                safe_windowsapps_component(&official_executable, false),
+                safe_windowsapps_component(&observed_executable, true),
+                safe_windowsapps_component(&official_executable, true),
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+const PROCESS_IDENTITY_SCRIPT: &str = r#"
+$culture=[Globalization.CultureInfo]::InvariantCulture
+$processId=[uint32]::Parse($env:CLE_CODEX_PID,$culture)
+$launchedAfter=[int64]::Parse($env:CLE_CODEX_LAUNCHED_AFTER_MILLIS,$culture)
+$process=Invoke-CCStep 'Get-CimInstance Win32_Process (activation PID)' { Get-CimInstance Win32_Process -Filter ('ProcessId = '+$processId.ToString($culture)) }
+Write-CCObservation 'activation PID observation' 'observed' @{processPresent=($null -ne $process); executableAvailable=($null -ne $process.ExecutablePath)}
+Invoke-CCStep 'required activation fields' {
+    if($null -eq $process){ Write-CCObservation 'activation identity gap' 'observed' @{missingField='process'; interpretation='activation PID not present in CIM snapshot'}; throw 'process identity is unavailable: activation PID not found' }
+    if([string]::IsNullOrWhiteSpace([string]$process.ExecutablePath)){ Write-CCObservation 'activation identity gap' 'observed' @{missingField='ExecutablePath'; interpretation='process exists but executable path unavailable'}; throw 'process identity is unavailable: executable path missing' }
+}
+$actual=Invoke-CCStep 'normalize observed executable' { [IO.Path]::GetFullPath([string]$process.ExecutablePath) }
+$target=Invoke-CCStep 'normalize official executable' { [IO.Path]::GetFullPath($env:CLE_CODEX_EXE) }
+$created=Invoke-CCStep 'convert activation creation time' { ([DateTimeOffset]$process.CreationDate).ToUnixTimeMilliseconds() }
+Invoke-CCStep 'serialize process identity' { [pscustomobject]@{ProcessId=[uint32]$process.ProcessId;CreationUnixMillis=[int64]$created;ExecutablePath=$actual;CreationMatches=($created -ge $launchedAfter);ExecutableMatches=$actual.Equals($target,[StringComparison]::OrdinalIgnoreCase)} | ConvertTo-Json -Compress }
+"#;
+
+#[cfg(windows)]
+fn diagnostic_query(
+    operation: &str,
+    script: &str,
+    environment: &[(&str, &std::ffi::OsStr)],
+    limit: usize,
+    port: Option<u16>,
+    pid: Option<u32>,
+) -> Result<Vec<u8>, ProcessGuardError> {
+    let result = crate::process_diagnostics::query(
+        operation,
+        script,
+        environment,
+        limit,
+        serde_json::json!({"port":port,"launchedPid":pid}),
+    );
+    if result.is_err() {
+        crate::process_diagnostics::native_observation(operation, port, pid);
+    }
+    result
+}
+
+pub fn verify_listener_owner(
+    port: u16,
+    launched_pid: u32,
+    launched_after: SystemTime,
+) -> Result<(), ProcessGuardError> {
+    let result = verify_listener_owner_inner(port, launched_pid, launched_after);
+    crate::process_diagnostics::observe(
+        "listener ownership",
+        "Rust identity decision",
+        if result.is_ok() { "passed" } else { "failed" },
+        serde_json::json!({"port":Some(port), "pid":Some(launched_pid), "reason":result.as_ref().err().map(ToString::to_string), "securityChecksRequired":true}),
+    );
+    result
+}
+
+fn verify_listener_owner_inner(
+    port: u16,
+    launched_pid: u32,
+    launched_after: SystemTime,
+) -> Result<(), ProcessGuardError> {
+    #[cfg(not(windows))]
+    {
+        let _ = (port, launched_pid, launched_after);
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        // Both interpolated values are integers created by this process. No
+        // renderer or filesystem text enters the PowerShell program.
+        let output = diagnostic_query(
+            "listener ownership",
+            &ownership_script(port),
+            &[],
+            4 * 1024 * 1024,
+            Some(port),
+            Some(launched_pid),
+        )?;
+        let snapshot: OwnershipSnapshot = serde_json::from_slice(&output)
+            .map_err(|error| ProcessGuardError::Detailed(format!("listener ownership response is invalid JSON: port={port}, category={:?}, line={}, column={}", error.classify(), error.line(), error.column())))?;
+        let launched_after_millis = launched_after
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                ProcessGuardError::OwnershipUnknown
+                    .context("verify_listener_owner_inner", format!("cause={error}"))
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|error| {
+                ProcessGuardError::OwnershipUnknown
+                    .context("verify_listener_owner_inner", format!("cause={error}"))
+            })?;
+        crate::process_diagnostics::observe(
+            "listener ownership",
+            "CIM snapshot",
+            "observed",
+            serde_json::json!({"snapshot":snapshot_observation(&snapshot, port, Some((launched_pid, launched_after_millis)), None)}),
+        );
+        verify_snapshot(&snapshot, launched_pid, launched_after_millis).map_err(|error| {
+            ProcessGuardError::Detailed(format!(
+                "{error}; {}",
+                snapshot_observation(
+                    &snapshot,
+                    port,
+                    Some((launched_pid, launched_after_millis)),
+                    None
+                )
+            ))
+        })
+    }
+}
+
+pub fn verify_listener_executable(
+    port: u16,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    let result = verify_listener_executable_inner(port, official_executable);
+    crate::process_diagnostics::observe(
+        "listener executable",
+        "Rust identity decision",
+        if result.is_ok() { "passed" } else { "failed" },
+        serde_json::json!({"port":Some(port), "pid":Option::<u32>::None, "reason":result.as_ref().err().map(ToString::to_string), "securityChecksRequired":true}),
+    );
+    result
+}
+
+fn verify_listener_executable_inner(
+    port: u16,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    verified_listener_snapshot(port, official_executable).map(drop)
+}
+
+fn verified_listener_snapshot(
+    port: u16,
+    official_executable: &Path,
+) -> Result<OwnershipSnapshot, ProcessGuardError> {
+    #[cfg(not(windows))]
+    {
+        let _ = (port, official_executable);
+        Err(ProcessGuardError::OwnershipUnknown)
+    }
+    #[cfg(windows)]
+    {
+        let official_executable = dunce::canonicalize(official_executable).map_err(|error| {
+            ProcessGuardError::Detailed(format!(
+                "official executable canonicalization failed: OS error {:?}",
+                error.raw_os_error()
+            ))
+        })?;
+        if !official_executable.is_file() {
+            return Err(ProcessGuardError::Detailed(
+                "canonical official executable is not a file".into(),
+            ));
+        }
+        let output = diagnostic_query(
+            "listener executable",
+            &ownership_script(port),
+            &[],
+            4 * 1024 * 1024,
+            Some(port),
+            None,
+        )?;
+        let snapshot: OwnershipSnapshot = serde_json::from_slice(&output)
+            .map_err(|error| ProcessGuardError::Detailed(format!("listener executable response is invalid JSON: port={port}, category={:?}, line={}, column={}", error.classify(), error.line(), error.column())))?;
+        crate::process_diagnostics::observe(
+            "listener executable",
+            "CIM snapshot",
+            "observed",
+            serde_json::json!({"snapshot":snapshot_observation(&snapshot, port, None, Some(&official_executable))}),
+        );
+        verify_snapshot_executable(&snapshot, &official_executable).map_err(|error| {
+            ProcessGuardError::Detailed(format!(
+                "{error}; {}",
+                snapshot_observation(&snapshot, port, None, Some(&official_executable))
+            ))
+        })?;
+        Ok(snapshot)
+    }
+}
+
+/// Observes an existing official process without acquiring termination rights.
+/// A login/layout gap must not stop live activation, but quitting this exact
+/// process must. Keeping the handle also prevents following a recycled PID.
+pub(crate) struct AttachedProcess {
+    pid: u32,
+    created_at: SystemTime,
+    #[cfg(windows)]
+    handle: OwnedHandle,
+}
+
+impl AttachedProcess {
+    pub(crate) fn for_listener(port: u16, executable: &Path) -> Result<Self, ProcessGuardError> {
+        #[cfg(not(windows))]
+        { let _ = (port, executable); Err(ProcessGuardError::OwnershipUnknown) }
+        #[cfg(windows)]
+        {
+            let snapshot = verified_listener_snapshot(port, executable)?;
+            let official = dunce::canonicalize(executable).map_err(|e|
+                ProcessGuardError::OwnershipUnknown.context("attached image canonicalization", e))?;
+            let processes: HashMap<_, _> = snapshot.processes.iter().map(|p| (p.process_id,p)).collect();
+            let mut owners = HashSet::new();
+            for listener in &snapshot.listeners {
+                let mut current = *listener;
+                let mut visited = HashSet::new();
+                for _ in 0..64 {
+                    if !visited.insert(current) { break; }
+                    let Some(process) = processes.get(&current) else { break; };
+                    if process.executable_path.as_deref().is_some_and(|p|
+                        p.eq_ignore_ascii_case(&official.to_string_lossy())) {
+                        owners.insert(process.process_id); break;
+                    }
+                    current = process.parent_process_id;
+                }
+            }
+            if owners.len() != 1 { return Err(ProcessGuardError::OwnershipUnknown); }
+            let pid = *owners.iter().next().ok_or(ProcessGuardError::OwnershipUnknown)?;
+            let process = processes[&pid];
+            let handle = retain_native_identity(pid, UNIX_EPOCH, &official, Some(process.creation_unix_millis))?;
+            let millis = u64::try_from(process.creation_unix_millis).map_err(|_|ProcessGuardError::OwnershipUnknown)?;
+            let created_at = UNIX_EPOCH.checked_add(Duration::from_millis(millis)).ok_or(ProcessGuardError::OwnershipUnknown)?;
+            let observer = Self {pid,created_at,handle};
+            observer.verify_listener(port)?;
+            Ok(observer)
+        }
+    }
+
+    pub(crate) fn pid(&self) -> u32 { self.pid }
+
+    pub(crate) fn verify_listener(&self, port: u16) -> Result<(), ProcessGuardError> {
+        self.running()?;
+        verify_listener_owner(port, self.pid, self.created_at)?;
+        self.running()
+    }
+
+    fn running(&self) -> Result<(), ProcessGuardError> {
+        #[cfg(windows)]
+        match process_handle_exit_code(&self.handle) {
+            Ok(None) => Ok(()),
+            Ok(Some(code)) => Err(ProcessGuardError::Detailed(format!("attached official process exited: pid={}; exitCode={code}",self.pid))),
+            Err(e) => Err(ProcessGuardError::ProcessInspectionUnknown.context("attached process observation",e)),
+        }
+        #[cfg(not(windows))]
+        { Err(ProcessGuardError::ProcessInspectionUnknown) }
+    }
+
+    pub(crate) async fn wait_for_exit(&self) -> Result<u32, ProcessGuardError> {
+        #[cfg(windows)]
+        loop {
+            match process_handle_exit_code(&self.handle) {
+                Ok(Some(code)) => return Ok(code),
+                Ok(None) => tokio::time::sleep(Duration::from_millis(250)).await,
+                Err(e) => return Err(ProcessGuardError::ProcessInspectionUnknown.context("attached process wait",e)),
+            }
+        }
+        #[cfg(not(windows))]
+        { Err(ProcessGuardError::ProcessInspectionUnknown) }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DebugListenerCandidate {
+    executable_path: String,
+    command_line: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DebugListenerCandidates {
+    candidates: Vec<DebugListenerCandidate>,
+}
+
+/// Find the loopback CDP listener of an already-running official Codex browser
+/// process. Candidate command lines are treated as untrusted observations and
+/// every selected port is verified again against the canonical official
+/// executable before it can be used.
+pub fn discover_listener_port(
+    official_executable: &Path,
+) -> Result<Option<u16>, ProcessGuardError> {
+    #[cfg(not(windows))]
+    {
+        let _ = official_executable;
+        Ok(None)
+    }
+    #[cfg(windows)]
+    {
+        const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+        const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $script:ccStep='Get-CimInstance (debugging port discovery)'; Write-CCObservation $script:ccStep 'started' @{}; $items=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.CommandLine -and $_.CommandLine -match '(?i)(^|\s)--remote-debugging-port(?:=|\s+)' } | Select-Object ExecutablePath,CommandLine); [pscustomobject]@{Candidates=$items} | ConvertTo-Json -Compress -Depth 3"#;
+
+        let official_executable = dunce::canonicalize(official_executable).map_err(|error| {
+            ProcessGuardError::OwnershipUnknown
+                .context("discover_listener_port", format!("cause={error}"))
+        })?;
+        if !official_executable.is_file() {
+            return Err(ProcessGuardError::OwnershipUnknown);
+        }
+        let output = diagnostic_query(
+            "listener discovery",
+            SCRIPT,
+            &[],
+            MAX_OUTPUT_BYTES,
+            None,
+            None,
+        )?;
+        let snapshot: DebugListenerCandidates =
+            serde_json::from_slice(&output).map_err(|error| {
+                ProcessGuardError::OwnershipUnknown
+                    .context("discover_listener_port", format!("cause={error}"))
+            })?;
+        let expected = official_executable.to_string_lossy().to_lowercase();
+        let mut candidate_ports = HashSet::new();
+        for candidate in snapshot.candidates {
+            let Ok(executable) = dunce::canonicalize(&candidate.executable_path) else {
+                continue;
+            };
+            if executable.to_string_lossy().to_lowercase() != expected {
+                continue;
+            }
+            let Some(port) = loopback_debugging_port(&candidate.command_line) else {
+                continue;
+            };
+            candidate_ports.insert(port);
+        }
+        let ports: HashSet<_> = candidate_ports
+            .into_iter()
+            .filter(|port| verify_listener_executable(*port, &official_executable).is_ok())
+            .collect();
+        match ports.len() {
+            0 => Ok(None),
+            1 => Ok(ports.into_iter().next()),
+            _ => Err(ProcessGuardError::OwnershipUnknown),
+        }
+    }
+}
+
+fn loopback_debugging_port(command_line: &str) -> Option<u16> {
+    if command_line_switch(command_line, "--type").is_some() {
+        return None;
+    }
+    let address = command_line_switch(command_line, "--remote-debugging-address")?;
+    if address != "127.0.0.1" {
+        return None;
+    }
+    command_line_switch(command_line, "--remote-debugging-port")?
+        .parse()
+        .ok()
+}
+
+fn command_line_switch<'a>(command_line: &'a str, name: &str) -> Option<&'a str> {
+    let mut tokens = command_line.split_whitespace().peekable();
+    while let Some(raw) = tokens.next() {
+        let token = raw.trim_matches(['"', '\'']);
+        if token.eq_ignore_ascii_case(name) {
+            return tokens.next().map(|value| value.trim_matches(['"', '\'']));
+        }
+        if let Some((prefix, value)) = token.split_once('=')
+            && prefix.eq_ignore_ascii_case(name)
+        {
+            return Some(value.trim_matches(['"', '\'']));
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn ownership_script(port: u16) -> String {
+    format!(
+        r#"
+$l=@(Invoke-CCStep 'Get-NetTCPConnection (loopback listener)' {{ Get-NetTCPConnection -State Listen -LocalPort {port} | Where-Object {{ $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '::1' }} | Select-Object -ExpandProperty OwningProcess -Unique }})
+Write-CCObservation 'listener PID observation' 'observed' @{{port={port}; listenerCount=$l.Count; listenerPids=$l}}
+$records=@(Invoke-CCStep 'Get-CimInstance Win32_Process (process snapshot)' {{ Get-CimInstance Win32_Process }})
+Write-CCObservation 'process snapshot observation' 'observed' @{{processRecordCount=$records.Count}}
+$p=@(Invoke-CCStep 'convert process creation times' {{ $records | Select-Object ProcessId,ParentProcessId,ExecutablePath,@{{Name='CreationUnixMillis';Expression={{([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds()}}}} }})
+Invoke-CCStep 'serialize ownership snapshot' {{ [pscustomobject]@{{Listeners=$l;Processes=$p}} | ConvertTo-Json -Compress -Depth 4 }}
+"#
+    )
+}
+
+pub fn is_executable_running(executable: &Path) -> Result<bool, ProcessGuardError> {
+    #[cfg(not(windows))]
+    {
+        let _ = executable;
+        Ok(false)
+    }
+    #[cfg(windows)]
+    {
+        // `ChatGPT.exe` is an Electron executable.  Win32_Process reports the
+        // same image path for the browser process and every renderer/GPU/
+        // utility child.  Counting the image path alone therefore makes a
+        // closed window look like a running Codex instance while a child is
+        // still winding down. Query only the matching image name, but compare
+        // file identity in Rust: WindowsApps may be a junction to another drive.
+        // only count browser/root command lines (known child processes carry
+        // an Electron `--type=` switch).  The diagnostic probe used by our
+        // compatibility checks
+        // checks has a private, recognisable user-data marker and must not
+        // block a normal launch if its parent was orphaned.
+        const SCRIPT: &str = r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $items=@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq $env:CLE_CODEX_IMAGE_NAME -and $_.ExecutablePath } | Select-Object ExecutablePath,CommandLine); ConvertTo-Json -InputObject $items -Compress"#;
+        let executable = dunce::canonicalize(executable)
+            .map_err(|_| ProcessGuardError::ProcessInspectionUnknown)?;
+        if !executable.is_file() {
+            return Err(ProcessGuardError::ProcessInspectionUnknown);
+        }
+        let output = diagnostic_query(
+            "existing process",
+            SCRIPT,
+            &[(
+                "CLE_CODEX_IMAGE_NAME",
+                executable
+                    .file_name()
+                    .ok_or(ProcessGuardError::ProcessInspectionUnknown)?,
+            )],
+            256 * 1024,
+            None,
+            None,
+        )?;
+        parse_running_query_result(true, &output, &executable)
+    }
+}
+
+/// Return whether a matching executable process represents an actual browser
+/// (root) process rather than an Electron child.  The Windows query above
+/// mirrors this predicate; keeping it in Rust gives us regression coverage for
+/// command-line shapes seen across Codex Desktop releases.
+#[cfg(any(windows, test))]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RunningProcessRecord {
+    executable_path: String,
+    command_line: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+fn should_count_running_process(command_line: Option<&str>) -> bool {
+    let Some(command_line) = command_line else {
+        // An unavailable command line must fail closed.  Treating it as a root
+        // process prevents a launcher from racing an uninspectable instance.
+        return true;
+    };
+    if command_line.trim().is_empty() {
+        return true;
+    }
+    if contains_ascii_case_insensitive(command_line, "CodeCodexOfficialProbe-") {
+        return false;
+    }
+    !contains_electron_type_switch(command_line)
+}
+
+#[cfg(any(windows, test))]
+fn contains_electron_type_switch(command_line: &str) -> bool {
+    const CHILD_TYPES: [&str; 8] = [
+        "renderer",
+        "gpu-process",
+        "utility",
+        "crashpad-handler",
+        "zygote",
+        "sandbox-helper",
+        "broker",
+        "ppapi",
+    ];
+    let mut tokens = command_line.split_whitespace().peekable();
+    while let Some(raw_token) = tokens.next() {
+        let token = raw_token.trim_matches(['"', '\'']).to_ascii_lowercase();
+        if let Some(value) = token.strip_prefix("--type=") {
+            if CHILD_TYPES.contains(&value) {
+                return true;
+            }
+        } else if token == "--type" {
+            let Some(raw_value) = tokens.next() else {
+                continue;
+            };
+            let value = raw_value.trim_matches(['"', '\'']).to_ascii_lowercase();
+            if CHILD_TYPES.contains(&value.as_str()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(any(windows, test))]
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+#[cfg(any(windows, test))]
+fn parse_running_query_result(
+    status_success: bool,
+    stdout: &[u8],
+    executable: &Path,
+) -> Result<bool, ProcessGuardError> {
+    const MAX_PROCESS_QUERY_OUTPUT_BYTES: usize = 256 * 1024;
+    if !status_success || stdout.is_empty() || stdout.len() > MAX_PROCESS_QUERY_OUTPUT_BYTES {
+        return Err(ProcessGuardError::ProcessInspectionUnknown);
+    }
+    let candidates: Vec<RunningProcessRecord> =
+        serde_json::from_slice(stdout).map_err(|_| ProcessGuardError::ProcessInspectionUnknown)?;
+    for candidate in candidates {
+        if should_count_running_process(candidate.command_line.as_deref())
+            && executable_paths_match_result(&candidate.executable_path, executable)
+                .map_err(|_| ProcessGuardError::ProcessInspectionUnknown)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_snapshot(
+    snapshot: &OwnershipSnapshot,
+    launched_pid: u32,
+    launched_after_millis: i64,
+) -> Result<(), ProcessGuardError> {
+    if snapshot.listeners.is_empty() {
+        return Err(ProcessGuardError::OwnershipUnknown);
+    }
+    let processes: HashMap<_, _> = snapshot
+        .processes
+        .iter()
+        .map(|process| (process.process_id, process))
+        .collect();
+    let creation_matches = snapshot.processes.iter().any(|process| {
+        process.process_id == launched_pid
+            && process.creation_unix_millis >= launched_after_millis.saturating_sub(5_000)
+    });
+    if creation_matches
+        && snapshot
+            .listeners
+            .iter()
+            .all(|listener| is_process_or_descendant(*listener, launched_pid, &processes))
+    {
+        Ok(())
+    } else {
+        Err(ProcessGuardError::OwnershipMismatch)
+    }
+}
+
+fn verify_snapshot_executable(
+    snapshot: &OwnershipSnapshot,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    if snapshot.listeners.is_empty() {
+        return Err(ProcessGuardError::OwnershipUnknown);
+    }
+    let processes: HashMap<_, _> = snapshot
+        .processes
+        .iter()
+        .map(|process| (process.process_id, process))
+        .collect();
+    if snapshot.listeners.iter().all(|listener| {
+        process_chain_contains_executable(*listener, official_executable, &processes)
+    }) {
+        Ok(())
+    } else {
+        Err(ProcessGuardError::ExecutableMismatch)
+    }
+}
+
+/// Keep support reports useful without copying CIM executable paths into them.
+fn snapshot_observation(
+    snapshot: &OwnershipSnapshot,
+    port: u16,
+    launched: Option<(u32, i64)>,
+    official_executable: Option<&Path>,
+) -> String {
+    let processes: HashMap<_, _> = snapshot
+        .processes
+        .iter()
+        .map(|process| (process.process_id, process))
+        .collect();
+    let mut details = vec![format!(
+        "port={port}, listener_count={}, process_records={}",
+        snapshot.listeners.len(),
+        snapshot.processes.len()
+    )];
+    if let Some(official) = official_executable {
+        details.push(format!(
+            "official_location={}",
+            path_location(&official.to_string_lossy())
+        ));
+    }
+    if let Some((pid, launched_after)) = launched {
+        let root = processes.get(&pid);
+        details.push(format!(
+            "launched_pid={pid}, launched_pid_in_CIM={}, launched_creation_within_tolerance={}",
+            root.is_some(),
+            root.is_some_and(
+                |record| record.creation_unix_millis >= launched_after.saturating_sub(5_000)
+            )
+        ));
+    }
+    for &listener in snapshot.listeners.iter().take(4) {
+        let mut chain = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = listener;
+        let mut child_creation = None;
+        for _ in 0..8 {
+            if current == 0 {
+                chain.push("parent=0".to_owned());
+                break;
+            }
+            if !visited.insert(current) {
+                chain.push(format!("cycle_at={current}"));
+                break;
+            }
+            let Some(process) = processes.get(&current) else {
+                chain.push(format!("missing_CIM_pid={current}"));
+                break;
+            };
+            let created_after_child =
+                child_creation.is_some_and(|created| process.creation_unix_millis > created);
+            let path_available = process
+                .executable_path
+                .as_deref()
+                .is_some_and(|path| !path.is_empty());
+            let path_matches = official_executable.is_some_and(|official| {
+                process
+                    .executable_path
+                    .as_deref()
+                    .is_some_and(|path| executable_paths_match(path, official))
+            });
+            chain.push(format!(
+                "pid={current}(parent={},path_available={path_available},path_location={},official_path_match={path_matches},parent_newer_than_child={created_after_child})",
+                process.parent_process_id,
+                process.executable_path.as_deref().map(path_location).unwrap_or("unavailable")
+            ));
+            if created_after_child {
+                break;
+            }
+            child_creation = Some(process.creation_unix_millis);
+            current = process.parent_process_id;
+        }
+        details.push(format!("listener_chain=[{}]", chain.join(" -> ")));
+    }
+    if snapshot.listeners.len() > 4 {
+        details.push(format!(
+            "additional_listeners_omitted={}",
+            snapshot.listeners.len() - 4
+        ));
+    }
+    details.join("; ")
+}
+
+fn path_location(path: &str) -> &'static str {
+    if path.is_empty() {
+        return "unavailable";
+    }
+    let normalized = path.replace('/', "\\").to_ascii_lowercase();
+    if normalized.contains("\\windowsapps\\") {
+        "WindowsApps"
+    } else if normalized.contains("\\program files\\")
+        || normalized.contains("\\program files (x86)\\")
+    {
+        "Program Files"
+    } else if normalized.contains("\\users\\") {
+        "user profile"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(windows)]
+fn safe_windowsapps_component(path: &Path, package: bool) -> String {
+    let components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let name = if package {
+        components
+            .windows(2)
+            .find(|pair| pair[0].eq_ignore_ascii_case("WindowsApps"))
+            .map(|pair| pair[1].as_str())
+    } else if components
+        .iter()
+        .any(|component| component.eq_ignore_ascii_case("WindowsApps"))
+    {
+        components.last().map(String::as_str)
+    } else {
+        None
+    };
+    name.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._-() ".contains(character))
+    })
+    .unwrap_or("redacted")
+    .to_owned()
+}
+
+fn process_chain_contains_executable(
+    pid: u32,
+    official_executable: &Path,
+    processes: &HashMap<u32, &ProcessRecord>,
+) -> bool {
+    let mut current = pid;
+    let mut visited = HashSet::new();
+    let mut child_creation = None;
+    for _ in 0..64 {
+        if current == 0 || !visited.insert(current) {
+            return false;
+        }
+        let Some(process) = processes.get(&current) else {
+            return false;
+        };
+        if child_creation.is_some_and(|created| process.creation_unix_millis > created) {
+            return false;
+        }
+        if process
+            .executable_path
+            .as_deref()
+            .is_some_and(|path| executable_paths_match(path, official_executable))
+        {
+            return true;
+        }
+        child_creation = Some(process.creation_unix_millis);
+        current = process.parent_process_id;
+    }
+    false
+}
+
+fn executable_paths_match(observed: &str, official: &Path) -> bool {
+    executable_paths_match_result(observed, official).unwrap_or(false)
+}
+
+fn executable_paths_match_result(observed: &str, official: &Path) -> io::Result<bool> {
+    if observed.eq_ignore_ascii_case(&official.to_string_lossy()) {
+        return Ok(true);
+    }
+    #[cfg(windows)]
+    {
+        use known_folders::{KnownFolder, get_known_folder_path};
+        let Some(program_files) = get_known_folder_path(KnownFolder::ProgramFiles) else {
+            return Err(io::Error::other(
+                "trusted Program Files location unavailable",
+            ));
+        };
+        protected_alias_matches(
+            Path::new(observed),
+            official,
+            &program_files.join("WindowsApps"),
+        )
+    }
+    #[cfg(not(windows))]
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn protected_alias_matches(
+    observed: &Path,
+    official: &Path,
+    trusted_root: &Path,
+) -> io::Result<bool> {
+    use std::path::{Component, Prefix};
+    // Check the original spelling before opening any alias. User-controlled
+    // junctions must never lend an unrelated running image an official identity.
+    if !observed.is_absolute()
+        || !matches!(observed.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)))
+        || observed
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || !path_starts_with(observed, trusted_root)
+    {
+        return Ok(false);
+    }
+    same_file::is_same_file(observed, official)
+}
+
+fn is_process_or_descendant(
+    pid: u32,
+    ancestor: u32,
+    processes: &HashMap<u32, &ProcessRecord>,
+) -> bool {
+    let mut current = pid;
+    let mut visited = HashSet::new();
+    let mut child_creation = None;
+    for _ in 0..64 {
+        if current == 0 || !visited.insert(current) {
+            return false;
+        }
+        let Some(process) = processes.get(&current) else {
+            return false;
+        };
+        if child_creation.is_some_and(|created| process.creation_unix_millis > created) {
+            return false;
+        }
+        if current == ancestor {
+            return true;
+        }
+        child_creation = Some(process.creation_unix_millis);
+        current = process.parent_process_id;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn path_starts_with(candidate: &Path, root: &Path) -> bool {
+    let candidate: Vec<_> = candidate
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let root: Vec<_> = root
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    candidate.starts_with(&root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_only_root_loopback_debugging_ports() {
+        assert_eq!(
+            loopback_debugging_port(
+                r#""C:\Program Files\WindowsApps\OpenAI.Codex\app\ChatGPT.exe" --remote-debugging-address=127.0.0.1 --remote-debugging-port=11512"#,
+            ),
+            Some(11512),
+        );
+        assert_eq!(
+            loopback_debugging_port(
+                r#"ChatGPT.exe --type=renderer --remote-debugging-address=127.0.0.1 --remote-debugging-port=11512"#,
+            ),
+            None,
+        );
+        assert_eq!(
+            loopback_debugging_port(
+                r#"ChatGPT.exe --remote-debugging-address=0.0.0.0 --remote-debugging-port=11512"#,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn quotes_windows_arguments_with_spaces_and_empty_values() {
+        assert_eq!(quote_windows_argument("plain"), "plain");
+        assert_eq!(quote_windows_argument(""), r#""""#);
+        assert_eq!(quote_windows_argument("two words"), r#""two words""#);
+        assert_eq!(
+            quote_windows_arguments(&["plain".to_owned(), "two words".to_owned()]),
+            r#"plain "two words""#
+        );
+    }
+
+    #[test]
+    fn quotes_windows_arguments_with_quotes_and_backslashes() {
+        assert_eq!(
+            quote_windows_argument(r#"say "hello""#),
+            r#""say \"hello\"""#
+        );
+        assert_eq!(
+            quote_windows_argument(r"C:\Program Files\Codex\"),
+            r#""C:\Program Files\Codex\\""#
+        );
+        assert_eq!(
+            quote_windows_argument(r#"C:\path\"quoted"#),
+            r#""C:\path\\\"quoted""#
+        );
+    }
+
+    #[test]
+    fn reserves_only_ipv4_loopback() {
+        let reservation = PortReservation::reserve().expect("reserve");
+        let address = reservation.listener.local_addr().expect("address");
+        assert_eq!(address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(address.port(), 0);
+    }
+
+    #[test]
+    fn verifies_descendant_process_chain_without_cycles() {
+        let mut snapshot = OwnershipSnapshot {
+            listeners: vec![30],
+            processes: vec![
+                ProcessRecord {
+                    process_id: 30,
+                    parent_process_id: 20,
+                    creation_unix_millis: 1_020,
+                    executable_path: None,
+                },
+                ProcessRecord {
+                    process_id: 20,
+                    parent_process_id: 10,
+                    creation_unix_millis: 1_010,
+                    executable_path: None,
+                },
+                ProcessRecord {
+                    process_id: 10,
+                    parent_process_id: 1,
+                    creation_unix_millis: 1_000,
+                    executable_path: None,
+                },
+            ],
+        };
+        assert!(verify_snapshot(&snapshot, 10, 1_000).is_ok());
+        assert!(verify_snapshot(&snapshot, 10, 10_000).is_err());
+        assert!(verify_snapshot(&snapshot, 99, 1_000).is_err());
+        snapshot.processes[1].creation_unix_millis = 2_000;
+        assert!(verify_snapshot(&snapshot, 10, 1_000).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verifies_a_real_loopback_listener_owner() {
+        let reservation = PortReservation::reserve().expect("reserve");
+        let port = reservation.port().expect("port");
+        verify_listener_owner(port, std::process::id(), UNIX_EPOCH)
+            .expect("current process owns listener");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detects_a_running_executable_by_canonical_path() {
+        let current = std::env::current_exe().expect("current executable");
+        assert!(is_executable_running(&current).expect("inspect running processes"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn protected_aliases_preserve_identity_and_reject_untrusted_paths() {
+        use std::fs;
+        let directory = tempfile::tempdir().unwrap();
+        let trusted = directory.path().join("WindowsApps");
+        fs::create_dir(&trusted).unwrap();
+        let image = trusted.join("official.exe");
+        fs::write(&image, "official image fixture").unwrap();
+        let alias = trusted.join(".").join("official.exe");
+        assert_eq!(
+            protected_alias_matches(&alias, &image, &trusted).unwrap(),
+            true
+        );
+        let user_alias = directory.path().join("user.exe");
+        fs::hard_link(&image, &user_alias).unwrap();
+        assert_eq!(
+            protected_alias_matches(&user_alias, &image, &trusted).unwrap(),
+            false
+        );
+        let other = trusted.join("other.exe");
+        fs::write(&other, "unrelated image").unwrap();
+        assert_eq!(
+            protected_alias_matches(&other, &image, &trusted).unwrap(),
+            false
+        );
+        assert!(protected_alias_matches(&trusted.join("missing.exe"), &image, &trusted).is_err());
+        assert_eq!(
+            protected_alias_matches(
+                &trusted.join("..").join("WindowsApps").join("official.exe"),
+                &image,
+                &trusted
+            )
+            .unwrap(),
+            false
+        );
+        let deceptive = directory.path().join("WindowsAppsEvil");
+        fs::create_dir(&deceptive).unwrap();
+        let deceptive_alias = deceptive.join("official.exe");
+        fs::hard_link(&image, &deceptive_alias).unwrap();
+        assert_eq!(
+            protected_alias_matches(&deceptive_alias, &image, &trusted).unwrap(),
+            false
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_diagnostic_only_exposes_windowsapps_file_and_package_names() {
+        let package = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+        );
+        assert_eq!(safe_windowsapps_component(package, false), "ChatGPT.exe");
+        assert_eq!(
+            safe_windowsapps_component(package, true),
+            "OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0"
+        );
+        assert_eq!(
+            safe_windowsapps_component(Path::new(r"C:\Users\someone\private.exe"), false),
+            "redacted"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verifies_a_real_process_identity_and_creation_time() {
+        let current = std::env::current_exe().expect("current executable");
+        verify_process_identity(std::process::id(), UNIX_EPOCH, &current)
+            .expect("verify current process identity");
+        assert!(
+            verify_process_identity(std::process::id(), SystemTime::now(), &current).is_err(),
+            "a process created before the supplied launch time must be rejected"
+        );
+    }
+
+    #[test]
+    fn process_query_output_fails_closed() {
+        let executable = Path::new(r"C:\Official\ChatGPT.exe");
+        let parse = |status, bytes: &[u8]| parse_running_query_result(status, bytes, executable);
+        assert_eq!(parse(true, b"[]\r\n").ok(), Some(false));
+        assert_eq!(
+            parse(
+                true,
+                br#"[{"ExecutablePath":"C:\\Official\\ChatGPT.exe","CommandLine":null}]"#
+            )
+            .ok(),
+            Some(true)
+        );
+        assert_eq!(
+            parse(
+                true,
+                br#"[{"ExecutablePath":"C:\\Other\\ChatGPT.exe","CommandLine":null}]"#
+            )
+            .ok(),
+            Some(false)
+        );
+        assert_eq!(parse(true, br#"[{"ExecutablePath":"C:\\Official\\ChatGPT.exe","CommandLine":"ChatGPT.exe --type=renderer"}]"#).ok(), Some(false));
+        assert!(parse(false, b"[]").is_err());
+        assert!(parse(true, b"").is_err());
+        assert!(parse(true, b"{}").is_err());
+        assert!(parse(true, &[0xff]).is_err());
+        assert!(parse(true, &vec![b' '; 256 * 1024 + 1]).is_err());
+    }
+
+    #[test]
+    fn running_process_query_counts_only_live_browser_roots() {
+        // Electron's browser process has no `--type` switch.  The root may
+        // carry the remote-debugging arguments that Code-Codex adds, so those
+        // must remain a positive match.
+        for command_line in [
+            r#"C:\Program Files\Codex\ChatGPT.exe"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --remote-debugging-address=127.0.0.1 --remote-debugging-port=4317"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --type=browser"#,
+        ] {
+            assert!(
+                should_count_running_process(Some(command_line)),
+                "browser root should count: {command_line}"
+            );
+        }
+
+        // Renderer, GPU, utility, and crashpad processes reuse ChatGPT.exe as
+        // their image path but are not an active desktop instance.
+        for command_line in [
+            r#""C:\Program Files\Codex\ChatGPT.exe" --type=renderer"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --type=gpu-process"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --type=utility"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --type=crashpad-handler"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --TYPE=renderer"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --type renderer"#,
+        ] {
+            assert!(
+                !should_count_running_process(Some(command_line)),
+                "Electron child should not count: {command_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn running_process_query_ignores_orphaned_compatibility_probes() {
+        for command_line in [
+            r#""C:\Program Files\Codex\ChatGPT.exe" --user-data-dir=C:\Users\user\AppData\Local\Temp\CodeCodexOfficialProbe-abc --remote-debugging-port=9338"#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --type=renderer --user-data-dir="C:\Users\user\AppData\Local\Temp\CodeCodexOfficialProbe-abc""#,
+            r#""C:\Program Files\Codex\ChatGPT.exe" --USER-DATA-DIR=C:\Temp\CODECODEXOFFICIALPROBE-ABC"#,
+        ] {
+            assert!(
+                !should_count_running_process(Some(command_line)),
+                "compatibility probe should not block launch: {command_line}"
+            );
+        }
+        // Command-line inspection failures remain conservative: an unknown
+        // process is treated as a live root rather than silently bypassed.
+        assert!(should_count_running_process(None));
+        assert!(should_count_running_process(Some("   ")));
+    }
+
+    #[test]
+    fn attached_listener_requires_the_official_executable_in_every_process_chain() {
+        let mut snapshot = OwnershipSnapshot {
+            listeners: vec![30],
+            processes: vec![
+                ProcessRecord {
+                    process_id: 30,
+                    parent_process_id: 20,
+                    creation_unix_millis: 0,
+                    executable_path: Some(r"C:\Official\helper.exe".to_owned()),
+                },
+                ProcessRecord {
+                    process_id: 20,
+                    parent_process_id: 0,
+                    creation_unix_millis: 0,
+                    executable_path: Some(r"C:\Official\Codex.exe".to_owned()),
+                },
+            ],
+        };
+        assert!(verify_snapshot_executable(&snapshot, Path::new(r"c:\official\CODEX.exe")).is_ok());
+        assert!(verify_snapshot_executable(&snapshot, Path::new(r"C:\Other\Codex.exe")).is_err());
+        snapshot.processes[0].creation_unix_millis = 1_000;
+        snapshot.processes[1].creation_unix_millis = 2_000;
+        assert!(
+            verify_snapshot_executable(&snapshot, Path::new(r"C:\Official\Codex.exe")).is_err()
+        );
+    }
+
+    #[test]
+    fn ownership_observation_identifies_missing_path_without_leaking_it() {
+        let snapshot = OwnershipSnapshot {
+            listeners: vec![30],
+            processes: vec![ProcessRecord {
+                process_id: 30,
+                parent_process_id: 20,
+                creation_unix_millis: 1_000,
+                executable_path: Some(r"C:\Users\secret\private.exe".to_owned()),
+            }],
+        };
+        let report = snapshot_observation(
+            &snapshot,
+            61373,
+            None,
+            Some(Path::new(r"C:\Program Files\Codex\Codex.exe")),
+        );
+        assert!(report.contains("port=61373"));
+        assert!(report.contains("missing_CIM_pid=20"));
+        assert!(report.contains("official_path_match=false"));
+        assert!(report.contains("path_location=user profile"));
+        assert!(!report.contains("secret"));
+        assert!(!report.contains(r"C:\Program Files"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn guarded_child_cleanup_waits_for_process_exit() {
+        let powershell = trusted_powershell().expect("trusted PowerShell");
+        let mut command = TokioCommand::new(powershell);
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
+        let mut guard = CodexChildGuard::spawn(command).expect("spawn child");
+        assert!(!guard.has_exited());
+        guard.terminate().await;
+        assert!(guard.has_exited());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn package_guard_survives_helper_failure_while_activated_process_is_alive() {
+        let powershell = trusted_powershell().expect("trusted PowerShell");
+        let mut activated_command = TokioCommand::new(&powershell);
+        activated_command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 350",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut activated_process = activated_command.spawn().expect("spawn activated process");
+        let activated_pid = activated_process.id().expect("activated process ID");
+
+        let mut helper_command = TokioCommand::new(&powershell);
+        helper_command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "exit 2",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut helper = helper_command.spawn().expect("spawn failing helper");
+        let control = helper.stdin.take();
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, activated_pid) };
+        assert!(!raw.is_null());
+        let mut guard = CodexProcessGuard::Package(Box::new(CodexPackageGuard {
+            helper,
+            control,
+            pid: activated_pid,
+            activation_handle: unsafe { OwnedHandle::from_raw_handle(raw.cast()) },
+            armed: true,
+            stderr_reader: None,
+        }));
+
+        let started = std::time::Instant::now();
+        let wait_result = guard.wait_for_exit().await;
+        let elapsed = started.elapsed();
+        let _ = activated_process.kill().await;
+        let _ = activated_process.wait().await;
+
+        assert!(
+            wait_result.is_ok(),
+            "a failed helper must not end supervision while the activated process is alive"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "the guard returned before the activated process exited"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn job_cleanup_kills_descendant_after_bootstrap_parent_exits() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let pid_file = directory.path().join("descendant.pid");
+        let powershell = trusted_powershell().expect("trusted PowerShell");
+        let mut command = TokioCommand::new(&powershell);
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$child=Start-Process -FilePath $env:CLE_POWERSHELL -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 30') -PassThru; [IO.File]::WriteAllText($env:CLE_CHILD_PID,[string]$child.Id)",
+            ])
+            .env("CLE_POWERSHELL", &powershell)
+            .env("CLE_CHILD_PID", &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut guard = CodexChildGuard::spawn(command).expect("spawn bootstrap");
+        let bootstrap_pid = guard.pid();
+
+        let descendant_pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("descendant pid");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process_exists(bootstrap_pid) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("bootstrap parent exit");
+        assert!(process_exists(descendant_pid));
+        assert!(
+            !guard.has_exited(),
+            "the observable Job Object must remain live while a descendant runs"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), guard.wait_for_exit())
+                .await
+                .is_err(),
+            "natural-exit monitoring must wait for the complete child tree"
+        );
+
+        guard.terminate().await;
+        assert!(guard.has_exited());
+        assert!(!process_exists(descendant_pid));
+    }
+
+    #[cfg(windows)]
+    fn process_exists(pid: u32) -> bool {
+        let Some(powershell) = trusted_powershell() else {
+            return false;
+        };
+        let script = format!(
+            "$process=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if($process){{exit 0}}else{{exit 1}}"
+        );
+        StdCommand::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+/// Fast, fail-closed ownership check for the capability-free loading animation.
+/// Full CIM executable verification and renderer qualification still follow.
+pub fn verify_listener_owner_fast(
+    port: u16,
+    pid: u32,
+    launched_after: SystemTime,
+) -> Result<(), ProcessGuardError> {
+    #[cfg(not(windows))]
+    {
+        let _ = (port, pid, launched_after);
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let mut bytes = 0u32;
+        unsafe {
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut bytes,
+                0,
+                2,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+        }
+        if bytes < 4 || bytes > 4 * 1024 * 1024 {
+            return Err(ProcessGuardError::OwnershipUnknown);
+        }
+        let mut table = vec![0u32; (bytes as usize).div_ceil(4)];
+        if unsafe {
+            GetExtendedTcpTable(
+                table.as_mut_ptr().cast(),
+                &mut bytes,
+                0,
+                2,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        } != 0
+        {
+            return Err(ProcessGuardError::OwnershipUnknown);
+        }
+        let count = table[0] as usize;
+        if 4 + count * std::mem::size_of::<MIB_TCPROW_OWNER_PID>() > bytes as usize {
+            return Err(ProcessGuardError::OwnershipUnknown);
+        }
+        let rows = unsafe {
+            std::slice::from_raw_parts(table.as_ptr().add(1).cast::<MIB_TCPROW_OWNER_PID>(), count)
+        };
+        let matches = rows.iter().any(|r| {
+            u16::from_be(r.dwLocalPort as u16) == port
+                && r.dwOwningPid == pid
+                && r.dwLocalAddr == u32::from_ne_bytes([127, 0, 0, 1])
+        });
+        if !matches {
+            return Err(ProcessGuardError::OwnershipMismatch);
+        }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return Err(ProcessGuardError::OwnershipUnknown);
+        }
+        let mut times = [FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        }; 4];
+        let ok = unsafe {
+            GetProcessTimes(
+                handle,
+                &mut times[0],
+                &mut times[1],
+                &mut times[2],
+                &mut times[3],
+            )
+        };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if ok == 0 {
+            return Err(ProcessGuardError::OwnershipUnknown);
+        }
+        let ticks = ((times[0].dwHighDateTime as u64) << 32) | times[0].dwLowDateTime as u64;
+        let created = ticks.saturating_sub(116444736000000000) / 10000;
+        let expected = launched_after
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                ProcessGuardError::OwnershipUnknown
+                    .context("verify_listener_owner_fast", format!("cause={error}"))
+            })?
+            .as_millis();
+        if (created as u128) < expected {
+            return Err(ProcessGuardError::OwnershipMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod early_owner_tests {
+    use super::*;
+    #[test]
+    fn fast_owner_checks_a_real_listener_and_rejects_pid_and_age_mismatches() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
+        let port = listener.local_addr().expect("address").port();
+        verify_listener_owner_fast(port, std::process::id(), UNIX_EPOCH)
+            .expect("native owner check");
+        assert!(verify_listener_owner_fast(port, 0, UNIX_EPOCH).is_err());
+        assert!(verify_listener_owner_fast(port, std::process::id(), SystemTime::now()).is_err());
+    }
+}

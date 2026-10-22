@@ -1,0 +1,20 @@
+{
+  "id": "pdf-preview",
+  "name": "PDF Preview",
+  "hostId": "code-codex.pdf-preview",
+  "category": "file-preview",
+  "api": 1,
+  "version": "1.0.1",
+  "releaseTag": "plugin-assets-2026-10-18",
+  "size": 1445453,
+  "sha256": "0097ddf35219738659f82327a6819481240231338180b4737acdefd1b9183bbd",
+  "asset": "CodeCodex-plugin-pdf-preview-1.0.1.js",
+  "relativePath": "CodeCodex-plugin-pdf-preview-1.0.1.js",
+  "resources": [],
+  "defaultImageCount": 0,
+  "capabilities": [
+    "file-preview"
+  ],
+  "source": "https://github.com/Rice-dog/code-codex",
+  "notices": "THIRD_PARTY_NOTICES_EN.md"
+}

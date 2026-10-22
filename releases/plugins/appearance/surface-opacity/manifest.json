@@ -1,0 +1,17 @@
+{
+  "id": "surface-opacity",
+  "name": "UI Surface Opacity",
+  "category": "appearance",
+  "api": 1,
+  "version": "1.0.3",
+  "releaseTag": "plugin-assets-2026-10-18",
+  "asset": "CodeCodex-plugin-surface-opacity-1.0.3.js",
+  "relativePath": "CodeCodex-plugin-surface-opacity-1.0.3.js",
+  "size": 12484,
+  "sha256": "3c0fd562b05ab9af6451cf6e7de0d7d5f8095ce78761650a0a8c4392832c54ab",
+  "resources": [],
+  "capabilities": [
+    "appearance"
+  ],
+  "source": "https://github.com/Rice-dog/code-codex"
+}
